@@ -57,10 +57,10 @@ index c9cde30..73de21f 100644
      &video_out_vdpau,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..8da01f3
+index 0000000..bafd2cd
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,225 @@
 +/*
 + * vo_avfoundation: present VideoToolbox-decoded frames on an
 + * AVSampleBufferDisplayLayer that the embedder owns (passed via --wid).
@@ -80,15 +80,21 @@ index 0000000..8da01f3
 +#import <CoreMedia/CoreMedia.h>
 +#import <CoreVideo/CoreVideo.h>
 +
++#include <libavutil/hwcontext.h>
++
 +#include "common/common.h"
 +#include "common/msg.h"
 +#include "options/options.h"
++#include "video/hwdec.h"
 +#include "video/mp_image.h"
 +#include "video/out/vo.h"
 +
 +struct priv {
 +    AVSampleBufferDisplayLayer *layer;   // borrowed; owned by the embedder via --wid
 +    CMVideoFormatDescriptionRef fmt;     // rebuilt when the pixel buffer format changes
++    struct mp_hwdec_ctx hwctx;           // VideoToolbox device we register for the decoder
++    bool hwdec_registered;
++    bool created_hwdec_devs;             // we own vo->hwdec_devs and must destroy it
 +};
 +
 +static int preinit(struct vo *vo)
@@ -112,9 +118,34 @@ index 0000000..8da01f3
 +    AVSampleBufferDisplayLayer *layer = p->layer;
 +    dispatch_async(dispatch_get_main_queue(), ^{
 +        layer.videoGravity = AVLayerVideoGravityResizeAspect;
-+        if (@available(iOS 16.0, tvOS 16.0, macOS 13.0, *))
++        if (@available(iOS 17.0, tvOS 17.0, macOS 14.0, *))
 +            layer.wantsExtendedDynamicRangeContent = YES;
 +    });
++
++    // Register a VideoToolbox hwdec device ourselves. Unlike the gpu VOs, this
++    // VO has no `ra` context, so mpv's ra_hwdec_videotoolbox never loads and the
++    // decoder would fall back to software (which this VO does not accept). The
++    // VideoToolbox device needs no GPU, so we can create and publish it here;
++    // the decoder then delivers zero-copy IMGFMT_VIDEOTOOLBOX (CVPixelBuffer)
++    // frames straight to draw_frame.
++    // A standalone VO starts with no hwdec registry (only the gpu VOs create
++    // one); create it so we can publish our device.
++    if (!vo->hwdec_devs) {
++        vo->hwdec_devs = hwdec_devices_create();
++        p->created_hwdec_devs = true;
++    }
++    p->hwctx = (struct mp_hwdec_ctx){
++        .driver_name = "avfoundation",
++        .hw_imgfmt = IMGFMT_VIDEOTOOLBOX,
++    };
++    int ret = av_hwdevice_ctx_create(&p->hwctx.av_device_ref,
++                                     AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0);
++    if (ret == 0) {
++        hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
++        p->hwdec_registered = true;
++    } else {
++        MP_WARN(vo, "could not create VideoToolbox hwdevice: %s\n", av_err2str(ret));
++    }
 +
 +    MP_VERBOSE(vo, "attached to AVSampleBufferDisplayLayer %p\n", (void *)p->layer);
 +    return 0;
@@ -218,6 +249,17 @@ index 0000000..8da01f3
 +static void uninit(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
++
++    if (p->hwdec_registered) {
++        hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
++        p->hwdec_registered = false;
++    }
++    av_buffer_unref(&p->hwctx.av_device_ref);
++    if (p->created_hwdec_devs && vo->hwdec_devs) {
++        hwdec_devices_destroy(vo->hwdec_devs);
++        vo->hwdec_devs = NULL;
++        p->created_hwdec_devs = false;
++    }
 +
 +    AVSampleBufferDisplayLayer *layer = p->layer;
 +    if (layer) {

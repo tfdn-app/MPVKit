@@ -301,8 +301,9 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1.2/Libmpv.xcframework.zip",
-            checksum: "b860cd793d4471e3d30370bc36385b845419328d5b6bf9bee1d995abd0d6146d"
+            // arnage #476: local build carrying the clean-room vo=avfoundation patch
+            // (instead of the upstream release). Produced by `make build platform=ios`.
+            path: "dist/release/xcframework/Libmpv.xcframework"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
