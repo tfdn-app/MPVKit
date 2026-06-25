@@ -1,0 +1,246 @@
+diff --git a/meson.build b/meson.build
+index 42ece8e..d05b34d 100644
+--- a/meson.build
++++ b/meson.build
+@@ -421,6 +421,18 @@ if features['cocoa']
+     main_fn_source = files('osdep/main-fn-mac.c')
+ endif
+ 
++# vo=avfoundation: present VideoToolbox frames on an AVSampleBufferDisplayLayer
++# (arnage #476). darwin-only; named avfoundation-vo to avoid the avfoundation
++# (audio output) option.
++avfoundation_vo = get_option('avfoundation-vo').require(darwin,
++    error_message: 'the avfoundation video output is only available on darwin')
++features += {'avfoundation-vo': avfoundation_vo.allowed()}
++if features['avfoundation-vo']
++    dependencies += dependency('appleframeworks',
++                               modules: ['AVFoundation', 'CoreMedia', 'CoreVideo', 'QuartzCore'])
++    sources += files('video/out/vo_avfoundation.m')
++endif
++
+ if posix
+     if not get_option('fuzzers') and cc.has_function('fork', prefix : '#include <unistd.h>')
+         sources += files('osdep/subprocess-posix.c')
+diff --git a/meson.options b/meson.options
+index 81bc931..554f52f 100644
+--- a/meson.options
++++ b/meson.options
+@@ -43,6 +43,7 @@ option('alsa', type: 'feature', value: 'auto', description: 'ALSA audio output')
+ option('audiounit', type: 'feature', value: 'auto', description: 'AudioUnit output (iOS)')
+ option('coreaudio', type: 'feature', value: 'auto', description: 'CoreAudio audio output')
+ option('avfoundation', type: 'feature', value: 'auto', description: 'AVFoundation audio output')
++option('avfoundation-vo', type: 'feature', value: 'auto', description: 'AVSampleBufferDisplayLayer video output (arnage #476)')
+ option('jack', type: 'feature', value: 'auto', description: 'JACK audio output')
+ option('openal', type: 'feature', value: 'disabled', description: 'OpenAL audio output')
+ option('audiotrack', type: 'feature', value: 'auto', description: 'Android AudioTrack audio output')
+diff --git a/video/out/vo.c b/video/out/vo.c
+index c9cde30..73de21f 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -52,6 +52,7 @@ extern const struct vo_driver video_out_vdpau;
+ extern const struct vo_driver video_out_xv;
+ extern const struct vo_driver video_out_gpu;
+ extern const struct vo_driver video_out_gpu_next;
++extern const struct vo_driver video_out_avfoundation;
+ extern const struct vo_driver video_out_libmpv;
+ extern const struct vo_driver video_out_null;
+ extern const struct vo_driver video_out_image;
+@@ -72,6 +73,9 @@ static const struct vo_driver *const video_out_drivers[] =
+     // high-quality and well-supported VOs first:
+     &video_out_gpu_next,
+     &video_out_gpu,
++#if HAVE_AVFOUNDATION_VO
++    &video_out_avfoundation,
++#endif
+ 
+ #if HAVE_VDPAU
+     &video_out_vdpau,
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+new file mode 100644
+index 0000000..8da01f3
+--- /dev/null
++++ b/video/out/vo_avfoundation.m
+@@ -0,0 +1,183 @@
++/*
++ * vo_avfoundation: present VideoToolbox-decoded frames on an
++ * AVSampleBufferDisplayLayer that the embedder owns (passed via --wid).
++ *
++ * Clean-room implementation (arnage #476). Authored from the public mpv VO
++ * API (video/out/vo.h, video/mp_image.h), mpv's own VideoToolbox frame
++ * handling (video/out/hwdec/hwdec_ios_gl.m: CVPixelBufferRef == planes[3]),
++ * and Apple's AVFoundation / CoreMedia / CoreVideo documentation. No code
++ * from any third-party vo=avfoundation implementation was consulted.
++ *
++ * This file is licensed under LGPLv2.1+ (it is linked into mpv).
++ *
++ * mpv is compiled without ARC: ObjC/CF memory is managed manually.
++ */
++
++#import <AVFoundation/AVFoundation.h>
++#import <CoreMedia/CoreMedia.h>
++#import <CoreVideo/CoreVideo.h>
++
++#include "common/common.h"
++#include "common/msg.h"
++#include "options/options.h"
++#include "video/mp_image.h"
++#include "video/out/vo.h"
++
++struct priv {
++    AVSampleBufferDisplayLayer *layer;   // borrowed; owned by the embedder via --wid
++    CMVideoFormatDescriptionRef fmt;     // rebuilt when the pixel buffer format changes
++};
++
++static int preinit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    int64_t wid = vo->opts->WinID;
++    if (wid <= 0) {
++        MP_FATAL(vo, "vo=avfoundation requires --wid set to an "
++                     "AVSampleBufferDisplayLayer pointer.\n");
++        return -1;
++    }
++
++    id obj = (id)(intptr_t)wid;
++    if (![obj isKindOfClass:[AVSampleBufferDisplayLayer class]]) {
++        MP_FATAL(vo, "--wid does not point at an AVSampleBufferDisplayLayer.\n");
++        return -1;
++    }
++
++    p->layer = (AVSampleBufferDisplayLayer *)obj;
++    AVSampleBufferDisplayLayer *layer = p->layer;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        layer.videoGravity = AVLayerVideoGravityResizeAspect;
++        if (@available(iOS 16.0, tvOS 16.0, macOS 13.0, *))
++            layer.wantsExtendedDynamicRangeContent = YES;
++    });
++
++    MP_VERBOSE(vo, "attached to AVSampleBufferDisplayLayer %p\n", (void *)p->layer);
++    return 0;
++}
++
++static int query_format(struct vo *vo, int format)
++{
++    // Present hardware frames only; mpv's videotoolbox hwdec delivers these.
++    return format == IMGFMT_VIDEOTOOLBOX;
++}
++
++static int reconfig(struct vo *vo, struct mp_image_params *params)
++{
++    struct priv *p = vo->priv;
++    // Drop the cached format description; the next frame rebuilds it from the
++    // incoming pixel buffer (which carries the up-to-date colorimetry).
++    if (p->fmt) {
++        CFRelease(p->fmt);
++        p->fmt = NULL;
++    }
++    return 0;
++}
++
++static bool draw_frame(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    if (!p->layer || !frame->current)
++        return true;
++
++    CVPixelBufferRef pb = (CVPixelBufferRef)frame->current->planes[3];
++    if (!pb)
++        return false;
++
++    // (Re)build the format description when the pixel buffer's format changes.
++    // CMVideoFormatDescriptionCreateForImageBuffer copies the color
++    // attachments (transfer function, primaries, matrix) from the buffer, so
++    // HDR frames are presented with their real colorimetry -> OS-driven EDR.
++    if (!p->fmt || !CMVideoFormatDescriptionMatchesImageBuffer(p->fmt, pb)) {
++        if (p->fmt) {
++            CFRelease(p->fmt);
++            p->fmt = NULL;
++        }
++        OSStatus st = CMVideoFormatDescriptionCreateForImageBuffer(
++            kCFAllocatorDefault, pb, &p->fmt);
++        if (st != noErr || !p->fmt) {
++            MP_ERR(vo, "CMVideoFormatDescriptionCreateForImageBuffer failed: %d\n",
++                   (int)st);
++            return false;
++        }
++    }
++
++    CMSampleTimingInfo timing = {
++        .duration = kCMTimeInvalid,
++        .presentationTimeStamp = kCMTimeInvalid,
++        .decodeTimeStamp = kCMTimeInvalid,
++    };
++    CMSampleBufferRef sbuf = NULL;
++    OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(
++        kCFAllocatorDefault, pb, p->fmt, &timing, &sbuf);
++    if (st != noErr || !sbuf) {
++        MP_ERR(vo, "CMSampleBufferCreateReadyWithImageBuffer failed: %d\n",
++               (int)st);
++        return false;
++    }
++
++    // mpv's render loop already paces draw_frame/flip_page to the target time,
++    // so request immediate display on the layer's own queue.
++    CFArrayRef attachments =
++        CMSampleBufferGetSampleAttachmentsArray(sbuf, true);
++    if (attachments && CFArrayGetCount(attachments) > 0) {
++        CFMutableDictionaryRef dict =
++            (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
++        CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately,
++                             kCFBooleanTrue);
++    }
++
++    AVSampleBufferDisplayLayer *layer = p->layer;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        if (layer.status == AVQueuedSampleBufferRenderingStatusFailed)
++            [layer flush];
++        [layer enqueueSampleBuffer:sbuf];
++        CFRelease(sbuf);   // block owns the only reference
++    });
++
++    return true;
++}
++
++static void flip_page(struct vo *vo)
++{
++    // Presentation is driven by enqueueSampleBuffer + DisplayImmediately;
++    // nothing to swap here.
++}
++
++static int control(struct vo *vo, uint32_t request, void *data)
++{
++    // No VOCTRL_SCREENSHOT here: the screenshot path routes through mpv's
++    // decoded-frame mechanism (screenshot-raw) and is audited in #482.
++    return VO_NOTIMPL;
++}
++
++static void uninit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    AVSampleBufferDisplayLayer *layer = p->layer;
++    if (layer) {
++        dispatch_async(dispatch_get_main_queue(), ^{
++            [layer flushAndRemoveImage];
++        });
++        p->layer = NULL;   // borrowed; do not release
++    }
++    if (p->fmt) {
++        CFRelease(p->fmt);
++        p->fmt = NULL;
++    }
++}
++
++const struct vo_driver video_out_avfoundation = {
++    .description = "AVSampleBufferDisplayLayer (clean-room, arnage #476)",
++    .name = "avfoundation",
++    .preinit = preinit,
++    .query_format = query_format,
++    .reconfig = reconfig,
++    .control = control,
++    .draw_frame = draw_frame,
++    .flip_page = flip_page,
++    .uninit = uninit,
++    .priv_size = sizeof(struct priv),
++};
