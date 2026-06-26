@@ -60,7 +60,7 @@ new file mode 100644
 index 0000000..bafd2cd
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,358 @@
 +/*
 + * vo_avfoundation: present VideoToolbox-decoded frames on an
 + * AVSampleBufferDisplayLayer that the embedder owns (passed via --wid).
@@ -124,10 +124,10 @@ index 0000000..bafd2cd
 +
 +    // Register a VideoToolbox hwdec device ourselves. Unlike the gpu VOs, this
 +    // VO has no `ra` context, so mpv's ra_hwdec_videotoolbox never loads and the
-+    // decoder would fall back to software (which this VO does not accept). The
-+    // VideoToolbox device needs no GPU, so we can create and publish it here;
-+    // the decoder then delivers zero-copy IMGFMT_VIDEOTOOLBOX (CVPixelBuffer)
-+    // frames straight to draw_frame.
++    // decoder would fall back to software. We accept software frames too (see
++    // query_format / sw_image_to_pixel_buffer), but registering the device lets
++    // VideoToolbox-decodable codecs deliver zero-copy IMGFMT_VIDEOTOOLBOX
++    // (CVPixelBuffer) frames straight to draw_frame.
 +    // A standalone VO starts with no hwdec registry (only the gpu VOs create
 +    // one); create it so we can publish our device.
 +    if (!vo->hwdec_devs) {
@@ -153,8 +153,16 @@ index 0000000..bafd2cd
 +
 +static int query_format(struct vo *vo, int format)
 +{
-+    // Present hardware frames only; mpv's videotoolbox hwdec delivers these.
-+    return format == IMGFMT_VIDEOTOOLBOX;
++    // Zero-copy hardware frames from mpv's videotoolbox hwdec, plus the two
++    // software biplanar formats we can upload into a CVPixelBuffer. Advertising
++    // the software formats makes mpv's autoconvert filter deliver every
++    // software-decoded frame (codecs VideoToolbox can't decode: AV1 on pre-A17,
++    // VP8/VP9, exotic) as NV12 (8-bit) or P010 (10-bit, HDR-capable), so no
++    // codec is lost. Hardware decode stays preferred (hwdec=videotoolbox); the
++    // software path is the fallback.
++    return format == IMGFMT_VIDEOTOOLBOX
++        || format == IMGFMT_NV12
++        || format == IMGFMT_P010;
 +}
 +
 +static int reconfig(struct vo *vo, struct mp_image_params *params)
@@ -169,13 +177,132 @@ index 0000000..bafd2cd
 +    return 0;
 +}
 +
++// MARK: - software frame -> CVPixelBuffer
++
++static CFStringRef cv_primaries(enum pl_color_primaries prim)
++{
++    switch (prim) {
++    case PL_COLOR_PRIM_BT_2020:     return kCVImageBufferColorPrimaries_ITU_R_2020;
++    case PL_COLOR_PRIM_BT_601_525:  return kCVImageBufferColorPrimaries_SMPTE_C;
++    case PL_COLOR_PRIM_BT_601_625:  return kCVImageBufferColorPrimaries_EBU_3213;
++    case PL_COLOR_PRIM_BT_709:
++    default:                        return kCVImageBufferColorPrimaries_ITU_R_709_2;
++    }
++}
++
++static CFStringRef cv_transfer(enum pl_color_transfer trc)
++{
++    switch (trc) {
++    case PL_COLOR_TRC_PQ:   return kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ;
++    case PL_COLOR_TRC_HLG:  return kCVImageBufferTransferFunction_ITU_R_2100_HLG;
++    case PL_COLOR_TRC_BT_1886:
++    case PL_COLOR_TRC_SRGB:
++    default:                return kCVImageBufferTransferFunction_ITU_R_709_2;
++    }
++}
++
++static CFStringRef cv_matrix(enum pl_color_system sys)
++{
++    switch (sys) {
++    case PL_COLOR_SYSTEM_BT_2020_NC:
++    case PL_COLOR_SYSTEM_BT_2020_C: return kCVImageBufferYCbCrMatrix_ITU_R_2020;
++    case PL_COLOR_SYSTEM_BT_601:    return kCVImageBufferYCbCrMatrix_ITU_R_601_4;
++    case PL_COLOR_SYSTEM_BT_709:
++    default:                        return kCVImageBufferYCbCrMatrix_ITU_R_709_2;
++    }
++}
++
++// Uploads a software-decoded biplanar mp_image (NV12 or P010) into a fresh
++// CVPixelBuffer, copying both planes and stamping the colorimetry so the
++// CMVideoFormatDescription built from it presents correct colors (and EDR for
++// PQ/HLG). Returns a +1 buffer the caller releases, or NULL on failure.
++static CVPixelBufferRef sw_image_to_pixel_buffer(struct vo *vo, struct mp_image *mpi)
++{
++    bool full = mpi->params.repr.levels == PL_COLOR_LEVELS_FULL;
++    OSType cvfmt;
++    switch (mpi->imgfmt) {
++    case IMGFMT_NV12:
++        cvfmt = full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
++                     : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
++        break;
++    case IMGFMT_P010:
++        cvfmt = full ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
++                     : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
++        break;
++    default:
++        return NULL;
++    }
++
++    // IOSurface-backed so AVSampleBufferDisplayLayer can present it.
++    CFDictionaryRef empty = CFDictionaryCreate(
++        NULL, NULL, NULL, 0,
++        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++    const void *keys[1] = { kCVPixelBufferIOSurfacePropertiesKey };
++    const void *vals[1] = { empty };
++    CFDictionaryRef attrs = CFDictionaryCreate(
++        NULL, keys, vals, 1,
++        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++
++    CVPixelBufferRef pb = NULL;
++    CVReturn r = CVPixelBufferCreate(kCFAllocatorDefault, mpi->w, mpi->h,
++                                     cvfmt, attrs, &pb);
++    CFRelease(attrs);
++    CFRelease(empty);
++    if (r != kCVReturnSuccess || !pb) {
++        MP_ERR(vo, "CVPixelBufferCreate failed: %d\n", (int)r);
++        return NULL;
++    }
++
++    CVPixelBufferLockBaseAddress(pb, 0);
++    size_t nplanes = CVPixelBufferGetPlaneCount(pb);   // 2 (Y, interleaved UV)
++    for (size_t pl = 0; pl < nplanes && pl < MP_MAX_PLANES; pl++) {
++        uint8_t *dst = CVPixelBufferGetBaseAddressOfPlane(pb, pl);
++        size_t dst_stride = CVPixelBufferGetBytesPerRowOfPlane(pb, pl);
++        size_t plane_h = CVPixelBufferGetHeightOfPlane(pb, pl);
++        uint8_t *src = mpi->planes[pl];
++        ptrdiff_t src_stride = mpi->stride[pl];
++        if (!dst || !src)
++            continue;
++        // Copy only the active row bytes; the smaller stride bounds both sides
++        // so neither padding region is over-read or over-written.
++        size_t abs_src = src_stride < 0 ? (size_t)(-src_stride) : (size_t)src_stride;
++        size_t row = dst_stride < abs_src ? dst_stride : abs_src;
++        for (size_t y = 0; y < plane_h; y++)
++            memcpy(dst + y * dst_stride, src + (ptrdiff_t)y * src_stride, row);
++    }
++    CVPixelBufferUnlockBaseAddress(pb, 0);
++
++    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
++                          cv_primaries(mpi->params.color.primaries),
++                          kCVAttachmentMode_ShouldPropagate);
++    CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
++                          cv_transfer(mpi->params.color.transfer),
++                          kCVAttachmentMode_ShouldPropagate);
++    CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
++                          cv_matrix(mpi->params.repr.sys),
++                          kCVAttachmentMode_ShouldPropagate);
++    return pb;
++}
++
 +static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 +{
 +    struct priv *p = vo->priv;
 +    if (!p->layer || !frame->current)
 +        return true;
 +
-+    CVPixelBufferRef pb = (CVPixelBufferRef)frame->current->planes[3];
++    struct mp_image *mpi = frame->current;
++
++    // Hardware frames carry the CVPixelBuffer in planes[3] (zero-copy);
++    // software frames are uploaded into a CVPixelBuffer we own and release.
++    CVPixelBufferRef pb;
++    bool owns_pb;
++    if (mpi->imgfmt == IMGFMT_VIDEOTOOLBOX) {
++        pb = (CVPixelBufferRef)mpi->planes[3];
++        owns_pb = false;
++    } else {
++        pb = sw_image_to_pixel_buffer(vo, mpi);
++        owns_pb = true;
++    }
 +    if (!pb)
 +        return false;
 +
@@ -193,6 +320,8 @@ index 0000000..bafd2cd
 +        if (st != noErr || !p->fmt) {
 +            MP_ERR(vo, "CMVideoFormatDescriptionCreateForImageBuffer failed: %d\n",
 +                   (int)st);
++            if (owns_pb)
++                CVPixelBufferRelease(pb);
 +            return false;
 +        }
 +    }
@@ -205,6 +334,10 @@ index 0000000..bafd2cd
 +    CMSampleBufferRef sbuf = NULL;
 +    OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(
 +        kCFAllocatorDefault, pb, p->fmt, &timing, &sbuf);
++    // The sample buffer now retains the image buffer (when it succeeds), so the
++    // software upload buffer can be released regardless of the outcome.
++    if (owns_pb)
++        CVPixelBufferRelease(pb);
 +    if (st != noErr || !sbuf) {
 +        MP_ERR(vo, "CMSampleBufferCreateReadyWithImageBuffer failed: %d\n",
 +               (int)st);
