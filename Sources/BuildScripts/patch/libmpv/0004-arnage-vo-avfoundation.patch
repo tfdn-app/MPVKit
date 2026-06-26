@@ -60,7 +60,7 @@ new file mode 100644
 index 0000000..bafd2cd
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,364 @@
 +/*
 + * vo_avfoundation: present VideoToolbox-decoded frames on an
 + * AVSampleBufferDisplayLayer that the embedder owns (passed via --wid).
@@ -79,6 +79,7 @@ index 0000000..bafd2cd
 +#import <AVFoundation/AVFoundation.h>
 +#import <CoreMedia/CoreMedia.h>
 +#import <CoreVideo/CoreVideo.h>
++#import <TargetConditionals.h>
 +
 +#include <libavutil/hwcontext.h>
 +
@@ -118,8 +119,13 @@ index 0000000..bafd2cd
 +    AVSampleBufferDisplayLayer *layer = p->layer;
 +    dispatch_async(dispatch_get_main_queue(), ^{
 +        layer.videoGravity = AVLayerVideoGravityResizeAspect;
-+        if (@available(iOS 17.0, tvOS 17.0, macOS 14.0, *))
++        // wantsExtendedDynamicRangeContent is an iOS/macOS/Catalyst API, not
++        // tvOS (where the system drives HDR natively) -- referencing it in a
++        // tvOS build is a compile error, so guard it out there.
++#if !TARGET_OS_TV
++        if (@available(iOS 16.0, macCatalyst 16.0, macOS 13.0, *))
 +            layer.wantsExtendedDynamicRangeContent = YES;
++#endif
 +    });
 +
 +    // Register a VideoToolbox hwdec device ourselves. Unlike the gpu VOs, this

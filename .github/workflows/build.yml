@@ -73,9 +73,14 @@ jobs:
       # GPL anti-DRM clause vs Apple's terms) and would impose copyleft on the
       # app. The LGPL build carries every decoder we need (h264/hevc/av1/vp9 are
       # LGPL); GPL only adds encoders (x264/x265) and filters we don't use.
+      # arnage: iOS-only. #478 ships an iOS app; the xcframework needs only the
+      # ios device + simulator slices (and that's what the local arnage.1 build
+      # produced). Skipping tvOS/macOS/visionOS roughly halves CI time. The VO's
+      # EDR line is already guarded for tvOS (#if !TARGET_OS_TV) for when the
+      # arc's Apple TV goal later builds all platforms.
       - name: Build LGPL version
         run: |
-          make build version=${{ env.RELEASE_VERSION }}
+          make build platform=ios version=${{ env.RELEASE_VERSION }}
 
       - name: Upload binary to GitHub Release
         uses: softprops/action-gh-release@v2
