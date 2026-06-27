@@ -57,10 +57,10 @@ index c9cde30..73de21f 100644
      &video_out_vdpau,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..bafd2cd
+index 0000000..b6d3364
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,417 @@
 +/*
 + * vo_avfoundation: present VideoToolbox-decoded frames on an
 + * AVSampleBufferDisplayLayer that the embedder owns (passed via --wid).
@@ -81,6 +81,8 @@ index 0000000..bafd2cd
 +#import <CoreVideo/CoreVideo.h>
 +#import <TargetConditionals.h>
 +
++#include <assert.h>
++
 +#include <libavutil/hwcontext.h>
 +
 +#include "common/common.h"
@@ -96,6 +98,9 @@ index 0000000..bafd2cd
 +    struct mp_hwdec_ctx hwctx;           // VideoToolbox device we register for the decoder
 +    bool hwdec_registered;
 +    bool created_hwdec_devs;             // we own vo->hwdec_devs and must destroy it
++    CVPixelBufferPoolRef pool;           // software-path buffer pool (keyed on w/h/fmt)
++    int pool_w, pool_h;
++    OSType pool_fmt;
 +};
 +
 +static int preinit(struct vo *vo)
@@ -123,7 +128,7 @@ index 0000000..bafd2cd
 +        // tvOS (where the system drives HDR natively) -- referencing it in a
 +        // tvOS build is a compile error, so guard it out there.
 +#if !TARGET_OS_TV
-+        if (@available(iOS 16.0, macCatalyst 16.0, macOS 13.0, *))
++        if (@available(iOS 17.0, macCatalyst 17.0, macOS 13.0, *))
 +            layer.wantsExtendedDynamicRangeContent = YES;
 +#endif
 +    });
@@ -180,6 +185,14 @@ index 0000000..bafd2cd
 +        CFRelease(p->fmt);
 +        p->fmt = NULL;
 +    }
++    // Drop the software-path pool; the next software frame rebuilds it for the
++    // new geometry/format.
++    if (p->pool) {
++        CVPixelBufferPoolRelease(p->pool);
++        p->pool = NULL;
++    }
++    p->pool_w = p->pool_h = 0;
++    p->pool_fmt = 0;
 +    return 0;
 +}
 +
@@ -224,6 +237,7 @@ index 0000000..bafd2cd
 +// PQ/HLG). Returns a +1 buffer the caller releases, or NULL on failure.
 +static CVPixelBufferRef sw_image_to_pixel_buffer(struct vo *vo, struct mp_image *mpi)
 +{
++    struct priv *p = vo->priv;
 +    bool full = mpi->params.repr.levels == PL_COLOR_LEVELS_FULL;
 +    OSType cvfmt;
 +    switch (mpi->imgfmt) {
@@ -239,23 +253,55 @@ index 0000000..bafd2cd
 +        return NULL;
 +    }
 +
-+    // IOSurface-backed so AVSampleBufferDisplayLayer can present it.
-+    CFDictionaryRef empty = CFDictionaryCreate(
-+        NULL, NULL, NULL, 0,
-+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-+    const void *keys[1] = { kCVPixelBufferIOSurfacePropertiesKey };
-+    const void *vals[1] = { empty };
-+    CFDictionaryRef attrs = CFDictionaryCreate(
-+        NULL, keys, vals, 1,
-+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++    // Pool the pixel buffers: allocating a CVPixelBuffer (+ its IOSurface) per
++    // frame is wasteful on the software-decode path. Rebuild the pool only when
++    // the geometry/format changes, reusing it across frames otherwise; reconfig
++    // and uninit release it.
++    if (!p->pool || p->pool_w != mpi->w || p->pool_h != mpi->h || p->pool_fmt != cvfmt) {
++        if (p->pool) {
++            CVPixelBufferPoolRelease(p->pool);
++            p->pool = NULL;
++        }
++        // The pool's pixelBufferAttributes describe the buffers it vends:
++        // IOSurface-backed (so the layer can present them), with this clip's
++        // format and geometry.
++        CFDictionaryRef empty = CFDictionaryCreate(
++            NULL, NULL, NULL, 0,
++            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        int fmt = (int)cvfmt;
++        CFNumberRef wn = CFNumberCreate(NULL, kCFNumberIntType, &mpi->w);
++        CFNumberRef hn = CFNumberCreate(NULL, kCFNumberIntType, &mpi->h);
++        CFNumberRef fn = CFNumberCreate(NULL, kCFNumberIntType, &fmt);
++        const void *keys[4] = {
++            kCVPixelBufferIOSurfacePropertiesKey,
++            kCVPixelBufferPixelFormatTypeKey,
++            kCVPixelBufferWidthKey,
++            kCVPixelBufferHeightKey,
++        };
++        const void *vals[4] = { empty, fn, wn, hn };
++        CFDictionaryRef attrs = CFDictionaryCreate(
++            NULL, keys, vals, 4,
++            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        CVReturn pr = CVPixelBufferPoolCreate(NULL, NULL, attrs, &p->pool);
++        CFRelease(attrs);
++        CFRelease(empty);
++        CFRelease(wn);
++        CFRelease(hn);
++        CFRelease(fn);
++        if (pr != kCVReturnSuccess || !p->pool) {
++            MP_ERR(vo, "CVPixelBufferPoolCreate failed: %d\n", (int)pr);
++            p->pool = NULL;
++            return NULL;
++        }
++        p->pool_w = mpi->w;
++        p->pool_h = mpi->h;
++        p->pool_fmt = cvfmt;
++    }
 +
 +    CVPixelBufferRef pb = NULL;
-+    CVReturn r = CVPixelBufferCreate(kCFAllocatorDefault, mpi->w, mpi->h,
-+                                     cvfmt, attrs, &pb);
-+    CFRelease(attrs);
-+    CFRelease(empty);
++    CVReturn r = CVPixelBufferPoolCreatePixelBuffer(NULL, p->pool, &pb);
 +    if (r != kCVReturnSuccess || !pb) {
-+        MP_ERR(vo, "CVPixelBufferCreate failed: %d\n", (int)r);
++        MP_ERR(vo, "CVPixelBufferPoolCreatePixelBuffer failed: %d\n", (int)r);
 +        return NULL;
 +    }
 +
@@ -269,6 +315,9 @@ index 0000000..bafd2cd
 +        ptrdiff_t src_stride = mpi->stride[pl];
 +        if (!dst || !src)
 +            continue;
++        // A valid plane has a non-zero stride; negative (bottom-up) strides are
++        // handled by the signed pointer arithmetic below.
++        assert(src_stride != 0);
 +        // Copy only the active row bytes; the smaller stride bounds both sides
 +        // so neither padding region is over-read or over-written.
 +        size_t abs_src = src_stride < 0 ? (size_t)(-src_stride) : (size_t)src_stride;
@@ -410,6 +459,10 @@ index 0000000..bafd2cd
 +    if (p->fmt) {
 +        CFRelease(p->fmt);
 +        p->fmt = NULL;
++    }
++    if (p->pool) {
++        CVPixelBufferPoolRelease(p->pool);
++        p->pool = NULL;
 +    }
 +}
 +
