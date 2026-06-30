@@ -57,19 +57,25 @@ index c9cde30..73de21f 100644
      &video_out_vdpau,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..b6d3364
+index 0000000..77c3a69
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,417 @@
+@@ -0,0 +1,640 @@
 +/*
 + * vo_avfoundation: present VideoToolbox-decoded frames on an
 + * AVSampleBufferDisplayLayer that the embedder owns (passed via --wid).
 + *
-+ * Clean-room implementation (arnage #476). Authored from the public mpv VO
-+ * API (video/out/vo.h, video/mp_image.h), mpv's own VideoToolbox frame
-+ * handling (video/out/hwdec/hwdec_ios_gl.m: CVPixelBufferRef == planes[3]),
-+ * and Apple's AVFoundation / CoreMedia / CoreVideo documentation. No code
-+ * from any third-party vo=avfoundation implementation was consulted.
++ * Clean-room implementation (arnage #476, #481). Authored from the public mpv
++ * VO API (video/out/vo.h, video/mp_image.h, sub/osd.h), mpv's own VideoToolbox
++ * frame handling (video/out/hwdec/hwdec_ios_gl.m: CVPixelBufferRef == planes[3]),
++ * mpv's OSD-on-image blender (sub/osd.h: osd_draw_on_image), and Apple's
++ * AVFoundation / CoreMedia / CoreVideo documentation. No code from any
++ * third-party vo=avfoundation implementation was consulted.
++ *
++ * The inline OSD layer (#481) composites subtitles/OSD onto a second,
++ * embedder-owned AVSampleBufferDisplayLayer (avfoundation-osd-wid) stacked
++ * above the video layer. mpv's blender handles libass text and BGRA image
++ * subs; the embedder keeps both layers' videoGravity in sync.
 + *
 + * This file is licensed under LGPLv2.1+ (it is linked into mpv).
 + *
@@ -85,9 +91,12 @@ index 0000000..b6d3364
 +
 +#include <libavutil/hwcontext.h>
 +
++#include "mpv_talloc.h"
 +#include "common/common.h"
 +#include "common/msg.h"
++#include "options/m_option.h"
 +#include "options/options.h"
++#include "sub/osd.h"
 +#include "video/hwdec.h"
 +#include "video/mp_image.h"
 +#include "video/out/vo.h"
@@ -101,6 +110,15 @@ index 0000000..b6d3364
 +    CVPixelBufferPoolRef pool;           // software-path buffer pool (keyed on w/h/fmt)
 +    int pool_w, pool_h;
 +    OSType pool_fmt;
++
++    // Inline OSD layer (arnage #481): a second embedder-owned layer the VO
++    // composites subtitles/OSD into. Borrowed via avfoundation-osd-wid.
++    AVSampleBufferDisplayLayer *osd_layer; // borrowed; owned by the embedder
++    int64_t osd_wid;                       // option: OSD layer pointer
++    bool composite_osd;                    // option: enable OSD compositing
++    CVPixelBufferPoolRef osd_pool;         // OSD BGRA canvas pool (keyed on w/h)
++    int osd_pool_w, osd_pool_h;
++    int64_t osd_change_id;                 // last composited OSD change id
 +};
 +
 +static int preinit(struct vo *vo)
@@ -158,6 +176,22 @@ index 0000000..b6d3364
 +        MP_WARN(vo, "could not create VideoToolbox hwdevice: %s\n", av_err2str(ret));
 +    }
 +
++    // Optional inline OSD layer (#481): a second embedder-owned
++    // AVSampleBufferDisplayLayer passed via avfoundation-osd-wid. Non-fatal —
++    // if absent or wrong-typed, OSD compositing stays disabled and video still
++    // plays. The embedder owns this layer and keeps its videoGravity in sync
++    // with the video layer, so the VO never touches its geometry.
++    if (p->composite_osd && p->osd_wid > 0) {
++        id osd_obj = (id)(intptr_t)p->osd_wid;
++        if ([osd_obj isKindOfClass:[AVSampleBufferDisplayLayer class]]) {
++            p->osd_layer = (AVSampleBufferDisplayLayer *)osd_obj;
++            MP_VERBOSE(vo, "inline OSD layer %p attached\n", (void *)p->osd_layer);
++        } else {
++            MP_WARN(vo, "avfoundation-osd-wid is not an "
++                        "AVSampleBufferDisplayLayer; OSD compositing disabled.\n");
++        }
++    }
++
 +    MP_VERBOSE(vo, "attached to AVSampleBufferDisplayLayer %p\n", (void *)p->layer);
 +    return 0;
 +}
@@ -193,6 +227,14 @@ index 0000000..b6d3364
 +    }
 +    p->pool_w = p->pool_h = 0;
 +    p->pool_fmt = 0;
++    // Drop the OSD canvas pool; the next OSD frame rebuilds it for the new
++    // geometry, and force a re-composite by resetting the change id.
++    if (p->osd_pool) {
++        CVPixelBufferPoolRelease(p->osd_pool);
++        p->osd_pool = NULL;
++    }
++    p->osd_pool_w = p->osd_pool_h = 0;
++    p->osd_change_id = 0;
 +    return 0;
 +}
 +
@@ -339,6 +381,164 @@ index 0000000..b6d3364
 +    return pb;
 +}
 +
++// MARK: - inline OSD layer (subtitles / OSD, arnage #481)
++
++// Composite the current subtitles onto the separate transparent OSD layer.
++// mpv's own blender (osd_draw_on_image) handles libass A8+color text and
++// premultiplied BGRA image subs (PGS/VobSub), including scaling, so we only
++// supply a BGRA canvas matching the video frame and present it on the OSD
++// layer. The embedder keeps the OSD layer's videoGravity in sync with the
++// video layer, so the OSD letterboxes/crops identically to the image.
++//
++// OSD_DRAW_SUB_ONLY draws subtitles only (not mpv's own OSD bar/messages — the
++// app drives its own chrome). Gated on the OSD change id: osd_render is
++// internally cached by change id, so an unchanged frame skips the costly
++// CVPixelBuffer composite + enqueue. An empty OSD flushes the layer once.
++static void draw_osd_overlay(struct vo *vo, struct mp_image *mpi)
++{
++    struct priv *p = vo->priv;
++    if (!p->composite_osd || !p->osd_layer || !vo->osd)
++        return;
++
++    static const bool osd_formats[SUBBITMAP_COUNT] = {
++        [SUBBITMAP_LIBASS] = true,
++        [SUBBITMAP_BGRA]   = true,
++    };
++    struct mp_osd_res res = osd_res_from_image_params(&mpi->params);
++
++    // Cheap change check before the expensive composite/enqueue. mpv caches the
++    // rendered bitmaps by change id, so this and the osd_draw_on_image below do
++    // not double the rendering cost. (Possible micro-optimisation: composite
++    // directly from this list instead of calling osd_draw_on_image.)
++    struct sub_bitmap_list *list =
++        osd_render(vo->osd, res, mpi->pts, OSD_DRAW_SUB_ONLY, osd_formats);
++    int64_t change_id = list ? list->change_id : 0;
++    int num_items = list ? list->num_items : 0;
++    talloc_free(list);
++    if (change_id == p->osd_change_id)
++        return;                 // OSD unchanged since the last enqueue
++    // Commit the change id only on the success paths below — a transient
++    // allocation failure must not advance it, or the same OSD content would be
++    // gated out on the next frame and the cue silently dropped.
++
++    AVSampleBufferDisplayLayer *osd_layer = p->osd_layer;
++    if (num_items == 0) {       // OSD cleared
++        p->osd_change_id = change_id;
++        dispatch_async(dispatch_get_main_queue(), ^{
++            [osd_layer flushAndRemoveImage];
++        });
++        return;
++    }
++
++    int w = mpi->w, h = mpi->h;
++    if (w <= 0 || h <= 0)
++        return;
++
++    // BGRA canvas pool, rebuilt on geometry change (mirrors the software pool).
++    if (!p->osd_pool || p->osd_pool_w != w || p->osd_pool_h != h) {
++        if (p->osd_pool) {
++            CVPixelBufferPoolRelease(p->osd_pool);
++            p->osd_pool = NULL;
++        }
++        CFDictionaryRef empty = CFDictionaryCreate(
++            NULL, NULL, NULL, 0,
++            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        int fmt = kCVPixelFormatType_32BGRA;
++        CFNumberRef wn = CFNumberCreate(NULL, kCFNumberIntType, &w);
++        CFNumberRef hn = CFNumberCreate(NULL, kCFNumberIntType, &h);
++        CFNumberRef fn = CFNumberCreate(NULL, kCFNumberIntType, &fmt);
++        const void *keys[4] = {
++            kCVPixelBufferIOSurfacePropertiesKey,
++            kCVPixelBufferPixelFormatTypeKey,
++            kCVPixelBufferWidthKey,
++            kCVPixelBufferHeightKey,
++        };
++        const void *vals[4] = { empty, fn, wn, hn };
++        CFDictionaryRef attrs = CFDictionaryCreate(
++            NULL, keys, vals, 4,
++            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        CVReturn pr = CVPixelBufferPoolCreate(NULL, NULL, attrs, &p->osd_pool);
++        CFRelease(attrs);
++        CFRelease(empty);
++        CFRelease(wn);
++        CFRelease(hn);
++        CFRelease(fn);
++        if (pr != kCVReturnSuccess || !p->osd_pool) {
++            MP_ERR(vo, "OSD CVPixelBufferPoolCreate failed: %d\n", (int)pr);
++            p->osd_pool = NULL;
++            return;
++        }
++        p->osd_pool_w = w;
++        p->osd_pool_h = h;
++    }
++
++    CVPixelBufferRef pb = NULL;
++    if (CVPixelBufferPoolCreatePixelBuffer(NULL, p->osd_pool, &pb) != kCVReturnSuccess
++        || !pb)
++        return;
++
++    CVPixelBufferLockBaseAddress(pb, 0);
++    uint8_t *base = CVPixelBufferGetBaseAddress(pb);
++    size_t bstride = CVPixelBufferGetBytesPerRow(pb);
++    // Transparent canvas: the OSD blends OVER, so start fully clear.
++    for (int y = 0; y < h; y++)
++        memset(base + (size_t)y * bstride, 0, (size_t)w * 4);
++
++    // Wrap the locked BGRA buffer as an mp_image and let mpv composite the OSD.
++    struct mp_image dst = {0};
++    mp_image_setfmt(&dst, IMGFMT_BGRA);
++    mp_image_set_size(&dst, w, h);
++    dst.planes[0] = base;
++    dst.stride[0] = (int)bstride;
++    // Standard SDR sRGB RGB target; the OSD layer presents it as plain SDR.
++    // Declare premultiplied alpha: AVSampleBufferDisplayLayer/CoreAnimation
++    // composite assuming premultiplied BGRA, and it lets mpv's blender write
++    // straight into the canvas (no unpremul round-trip that would otherwise
++    // emit non-premultiplied alpha and fringe the antialiased text edges).
++    dst.params.color.primaries = PL_COLOR_PRIM_BT_709;
++    dst.params.color.transfer  = PL_COLOR_TRC_SRGB;
++    dst.params.repr.levels     = PL_COLOR_LEVELS_FULL;
++    dst.params.repr.alpha      = PL_ALPHA_PREMULTIPLIED;
++
++    osd_draw_on_image(vo->osd, res, mpi->pts, OSD_DRAW_SUB_ONLY, &dst);
++    CVPixelBufferUnlockBaseAddress(pb, 0);
++
++    CMVideoFormatDescriptionRef fmtdesc = NULL;
++    if (CMVideoFormatDescriptionCreateForImageBuffer(
++            kCFAllocatorDefault, pb, &fmtdesc) != noErr || !fmtdesc) {
++        CVPixelBufferRelease(pb);
++        return;
++    }
++    CMSampleTimingInfo timing = {
++        .duration = kCMTimeInvalid,
++        .presentationTimeStamp = kCMTimeInvalid,
++        .decodeTimeStamp = kCMTimeInvalid,
++    };
++    CMSampleBufferRef sbuf = NULL;
++    OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(
++        kCFAllocatorDefault, pb, fmtdesc, &timing, &sbuf);
++    CFRelease(fmtdesc);
++    CVPixelBufferRelease(pb);
++    if (st != noErr || !sbuf)
++        return;
++
++    CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sbuf, true);
++    if (att && CFArrayGetCount(att) > 0) {
++        CFMutableDictionaryRef d =
++            (CFMutableDictionaryRef)CFArrayGetValueAtIndex(att, 0);
++        CFDictionarySetValue(d, kCMSampleAttachmentKey_DisplayImmediately,
++                             kCFBooleanTrue);
++    }
++    // All fallible allocations succeeded: commit the change id, then enqueue.
++    p->osd_change_id = change_id;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        if (osd_layer.status == AVQueuedSampleBufferRenderingStatusFailed)
++            [osd_layer flush];
++        [osd_layer enqueueSampleBuffer:sbuf];
++        CFRelease(sbuf);
++    });
++}
++
 +static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 +{
 +    struct priv *p = vo->priv;
@@ -418,6 +618,9 @@ index 0000000..b6d3364
 +        CFRelease(sbuf);   // block owns the only reference
 +    });
 +
++    // Composite subtitles/OSD onto the inline OSD layer (no-op if disabled).
++    draw_osd_overlay(vo, mpi);
++
 +    return true;
 +}
 +
@@ -464,7 +667,19 @@ index 0000000..b6d3364
 +        CVPixelBufferPoolRelease(p->pool);
 +        p->pool = NULL;
 +    }
++    if (p->osd_pool) {
++        CVPixelBufferPoolRelease(p->osd_pool);
++        p->osd_pool = NULL;
++    }
++    p->osd_layer = NULL;   // borrowed; owned by the embedder, do not release
 +}
++
++#define OPT_BASE_STRUCT struct priv
++static const struct m_option avf_options[] = {
++    {"osd-wid", OPT_INT64(osd_wid)},
++    {"composite-osd", OPT_BOOL(composite_osd)},
++    {0}
++};
 +
 +const struct vo_driver video_out_avfoundation = {
 +    .description = "AVSampleBufferDisplayLayer (clean-room, arnage #476)",
@@ -477,4 +692,12 @@ index 0000000..b6d3364
 +    .flip_page = flip_page,
 +    .uninit = uninit,
 +    .priv_size = sizeof(struct priv),
++    .priv_defaults = &(const struct priv){
++        .composite_osd = true,
++    },
++    .options = avf_options,
++    // Registers the options as global --avfoundation-osd-wid /
++    // --avfoundation-composite-osd (the embedder sets them before
++    // mpv_initialize, mirroring --wid).
++    .options_prefix = "avfoundation",
 +};
