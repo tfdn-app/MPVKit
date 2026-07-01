@@ -57,10 +57,10 @@ index c9cde30..73de21f 100644
      &video_out_vdpau,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..7914cbf
+index 0000000..72ee647
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,952 @@
+@@ -0,0 +1,984 @@
 +/*
 + * vo_avfoundation: present VideoToolbox-decoded frames on an
 + * AVSampleBufferDisplayLayer that the embedder owns (passed via --wid).
@@ -264,6 +264,7 @@ index 0000000..7914cbf
 +    }
 +    p->burn_osd_change_id = 0;
 +    p->burn_osd_items = 0;
++    p->burn_osd_flushed = false;
 +    if (p->burn_pool) {
 +        CVPixelBufferPoolRelease(p->burn_pool);
 +        p->burn_pool = NULL;
@@ -727,9 +728,18 @@ index 0000000..7914cbf
 +            CVPixelBufferRelease(p->burn_osd_buf);
 +            p->burn_osd_buf = NULL;
 +        }
-+        p->burn_osd_buf = render_burn_osd_canvas(vo, mpi, num_items);
-+        p->burn_osd_change_id = change_id;
-+        p->burn_osd_items = p->burn_osd_buf ? num_items : 0;
++        CVPixelBufferRef fresh = render_burn_osd_canvas(vo, mpi, num_items);
++        // Only commit the change id on success (or a legitimate empty OSD). A
++        // transient canvas-alloc failure with num_items>0 must NOT advance the
++        // id, or the same cue would be gated out for the rest of its life and
++        // silently dropped (mirrors the #481 draw_osd_overlay invariant). Leave
++        // the id stale so the next frame retries; we enqueue the plain frame
++        // this once.
++        if (fresh || num_items == 0) {
++            p->burn_osd_buf = fresh;
++            p->burn_osd_items = fresh ? num_items : 0;
++            p->burn_osd_change_id = change_id;
++        }
 +    }
 +    if (!p->burn_osd_buf || p->burn_osd_items == 0)
 +        return NULL;   // nothing to burn — caller enqueues the plain frame
@@ -793,9 +803,21 @@ index 0000000..7914cbf
 +    }
 +
 +    CGColorSpaceRef out_cs = burn_output_colorspace(mpi->params.color.transfer);
++    if (!out_cs) {
++        // Without a target colour space, CoreImage would encode extended-linear
++        // BT.2020 values into a PQ/HLG-tagged buffer -> wrong colours. Fall back
++        // to the plain frame rather than emit mis-tagged pixels.
++        CVPixelBufferRelease(out);
++        return NULL;
++    }
++    CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
 +    @autoreleasepool {
 +        CIImage *bg = [CIImage imageWithCVPixelBuffer:video];
-+        CIImage *fg = [CIImage imageWithCVPixelBuffer:p->burn_osd_buf];
++        // Tag the untagged BGRA OSD canvas as sRGB explicitly so CoreImage maps
++        // SDR white to reference white (not the PQ/HLG peak) — this is what
++        // keeps subtitles legible and unclipped over HDR video.
++        NSDictionary *fgOpts = srgb ? @{ (id)kCIImageColorSpace: (id)srgb } : @{};
++        CIImage *fg = [CIImage imageWithCVPixelBuffer:p->burn_osd_buf options:fgOpts];
 +        if (bg && fg) {
 +            CIImage *composited = [fg imageByCompositingOverImage:bg];
 +            [p->ci_ctx render:composited
@@ -807,8 +829,9 @@ index 0000000..7914cbf
 +            out = NULL;
 +        }
 +    }
-+    if (out_cs)
-+        CGColorSpaceRelease(out_cs);
++    if (srgb)
++        CGColorSpaceRelease(srgb);
++    CGColorSpaceRelease(out_cs);
 +    return out;
 +}
 +
@@ -837,7 +860,11 @@ index 0000000..7914cbf
 +    // PiP burn-in (arnage #480): composite the OSD into the video frame so the
 +    // single layer the OS shows in PiP carries subtitles. Off by default; when
 +    // off this whole block is skipped and the VO behaves exactly as #481.
-+    bool burn_in = burn_in_active(p);
++    // burn_in_active reads a KVC flag → an autoreleased NSNumber; mpv's
++    // vo_thread wraps nothing, so drain it here (the rest of draw_frame uses
++    // only CoreFoundation create-rule objects).
++    bool burn_in;
++    @autoreleasepool { burn_in = burn_in_active(p); }
 +    if (burn_in) {
 +        CVPixelBufferRef burned = burn_composite(vo, mpi, pb);
 +        if (burned) {
@@ -855,6 +882,11 @@ index 0000000..7914cbf
 +                [ol flushAndRemoveImage];
 +            });
 +        }
++        // draw_osd_overlay is skipped while burning in, so the inline OSD
++        // layer's change id is frozen. Invalidate it so the overlay
++        // re-composites the current cue the moment burn-in turns back off
++        // (e.g. leaving PiP mid-cue) instead of early-returning on a stale id.
++        p->osd_change_id = 0;
 +    } else {
 +        p->burn_osd_flushed = false;
 +    }
