@@ -57,10 +57,10 @@ index c9cde30..73de21f 100644
      &video_out_vdpau,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..77c3a69
+index 0000000..7914cbf
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,952 @@
 +/*
 + * vo_avfoundation: present VideoToolbox-decoded frames on an
 + * AVSampleBufferDisplayLayer that the embedder owns (passed via --wid).
@@ -83,6 +83,7 @@ index 0000000..77c3a69
 + */
 +
 +#import <AVFoundation/AVFoundation.h>
++#import <CoreImage/CoreImage.h>
 +#import <CoreMedia/CoreMedia.h>
 +#import <CoreVideo/CoreVideo.h>
 +#import <TargetConditionals.h>
@@ -119,6 +120,27 @@ index 0000000..77c3a69
 +    CVPixelBufferPoolRef osd_pool;         // OSD BGRA canvas pool (keyed on w/h)
 +    int osd_pool_w, osd_pool_h;
 +    int64_t osd_change_id;                 // last composited OSD change id
++
++    // OSD burn-in (arnage #480, PiP): while in PiP the OS shows only the single
++    // video layer, so the OSD must be composited INTO the video frame instead of
++    // the separate osd_layer. GPU composite (CoreImage) of the cached OSD BGRA
++    // canvas over each video frame; the cached canvas is re-rendered only when
++    // the OSD change id moves. Isolated from the inline-OSD path above — when
++    // burn-in is off the VO behaves exactly as #481.
++    //
++    // Toggled at runtime by the embedder via a KVC flag on the video layer
++    // (layer.setValue(bool, forKey:"arnageOsdBurnIn")) — NOT an mpv option: a
++    // VO driver's private options are a snapshot of the config taken at VO
++    // creation (m_config_group_from_desc), so mpv_set_property on them does not
++    // reach vo->priv live. The layer is embedder-owned and read each frame.
++    CVPixelBufferRef burn_osd_buf;         // cached OSD BGRA canvas (retained, +1)
++    int64_t burn_osd_change_id;            // change id of the cached OSD canvas
++    int burn_osd_items;                    // num_items of the cached OSD canvas
++    bool burn_osd_flushed;                 // separate osd_layer flushed once for PiP
++    CIContext *ci_ctx;                     // CoreImage context for the composite
++    CVPixelBufferPoolRef burn_pool;        // composited-output pool (video fmt)
++    int burn_pool_w, burn_pool_h;
++    OSType burn_pool_fmt;
 +};
 +
 +static int preinit(struct vo *vo)
@@ -235,6 +257,19 @@ index 0000000..77c3a69
 +    }
 +    p->osd_pool_w = p->osd_pool_h = 0;
 +    p->osd_change_id = 0;
++    // Drop the burn-in cached canvas + output pool; the next frame rebuilds them.
++    if (p->burn_osd_buf) {
++        CVPixelBufferRelease(p->burn_osd_buf);
++        p->burn_osd_buf = NULL;
++    }
++    p->burn_osd_change_id = 0;
++    p->burn_osd_items = 0;
++    if (p->burn_pool) {
++        CVPixelBufferPoolRelease(p->burn_pool);
++        p->burn_pool = NULL;
++    }
++    p->burn_pool_w = p->burn_pool_h = 0;
++    p->burn_pool_fmt = 0;
 +    return 0;
 +}
 +
@@ -539,6 +574,244 @@ index 0000000..77c3a69
 +    });
 +}
 +
++// MARK: - OSD burn-in for PiP (arnage #480)
++
++// Render the current subtitles/OSD into a fresh BGRA CVPixelBuffer sized to the
++// video frame. Unlike draw_osd_overlay this does NOT gate on the change id —
++// burn_composite caches the result and reuses it across unchanged frames.
++// Reuses osd_pool (idle while burning in, since the separate osd_layer is not
++// presented). Returns a +1 buffer the caller releases, or NULL (no OSD / fail).
++static CVPixelBufferRef render_burn_osd_canvas(struct vo *vo, struct mp_image *mpi,
++                                               int num_items)
++{
++    struct priv *p = vo->priv;
++    if (num_items == 0 || !vo->osd)
++        return NULL;
++
++    int w = mpi->w, h = mpi->h;
++    if (w <= 0 || h <= 0)
++        return NULL;
++
++    if (!p->osd_pool || p->osd_pool_w != w || p->osd_pool_h != h) {
++        if (p->osd_pool) {
++            CVPixelBufferPoolRelease(p->osd_pool);
++            p->osd_pool = NULL;
++        }
++        CFDictionaryRef empty = CFDictionaryCreate(
++            NULL, NULL, NULL, 0,
++            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        int fmt = kCVPixelFormatType_32BGRA;
++        CFNumberRef wn = CFNumberCreate(NULL, kCFNumberIntType, &w);
++        CFNumberRef hn = CFNumberCreate(NULL, kCFNumberIntType, &h);
++        CFNumberRef fn = CFNumberCreate(NULL, kCFNumberIntType, &fmt);
++        const void *keys[4] = {
++            kCVPixelBufferIOSurfacePropertiesKey,
++            kCVPixelBufferPixelFormatTypeKey,
++            kCVPixelBufferWidthKey,
++            kCVPixelBufferHeightKey,
++        };
++        const void *vals[4] = { empty, fn, wn, hn };
++        CFDictionaryRef attrs = CFDictionaryCreate(
++            NULL, keys, vals, 4,
++            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        CVReturn pr = CVPixelBufferPoolCreate(NULL, NULL, attrs, &p->osd_pool);
++        CFRelease(attrs);
++        CFRelease(empty);
++        CFRelease(wn);
++        CFRelease(hn);
++        CFRelease(fn);
++        if (pr != kCVReturnSuccess || !p->osd_pool) {
++            MP_ERR(vo, "burn-in OSD pool create failed: %d\n", (int)pr);
++            p->osd_pool = NULL;
++            return NULL;
++        }
++        p->osd_pool_w = w;
++        p->osd_pool_h = h;
++    }
++
++    CVPixelBufferRef pb = NULL;
++    if (CVPixelBufferPoolCreatePixelBuffer(NULL, p->osd_pool, &pb) != kCVReturnSuccess
++        || !pb)
++        return NULL;
++
++    CVPixelBufferLockBaseAddress(pb, 0);
++    uint8_t *base = CVPixelBufferGetBaseAddress(pb);
++    size_t bstride = CVPixelBufferGetBytesPerRow(pb);
++    for (int y = 0; y < h; y++)
++        memset(base + (size_t)y * bstride, 0, (size_t)w * 4);
++
++    struct mp_osd_res res = osd_res_from_image_params(&mpi->params);
++    struct mp_image dst = {0};
++    mp_image_setfmt(&dst, IMGFMT_BGRA);
++    mp_image_set_size(&dst, w, h);
++    dst.planes[0] = base;
++    dst.stride[0] = (int)bstride;
++    dst.params.color.primaries = PL_COLOR_PRIM_BT_709;
++    dst.params.color.transfer  = PL_COLOR_TRC_SRGB;
++    dst.params.repr.levels     = PL_COLOR_LEVELS_FULL;
++    dst.params.repr.alpha      = PL_ALPHA_PREMULTIPLIED;
++
++    osd_draw_on_image(vo->osd, res, mpi->pts, OSD_DRAW_SUB_ONLY, &dst);
++    CVPixelBufferUnlockBaseAddress(pb, 0);
++    return pb;
++}
++
++// SDR OSD text/graphics must land at SDR reference white in the output, not at
++// PQ/HLG peak — so the composite is colour-managed to the video's transfer.
++static CGColorSpaceRef burn_output_colorspace(enum pl_color_transfer trc)
++{
++    if (trc == PL_COLOR_TRC_PQ)
++        return CGColorSpaceCreateWithName(kCGColorSpaceITUR_2020_PQ);
++    if (trc == PL_COLOR_TRC_HLG)
++        return CGColorSpaceCreateWithName(kCGColorSpaceITUR_2020_HLG);
++    return CGColorSpaceCreateWithName(kCGColorSpaceITUR_709);
++}
++
++static void ensure_ci_ctx(struct priv *p)
++{
++    if (p->ci_ctx)
++        return;
++    // HDR-capable working space: extended-linear BT.2020 with half-float
++    // precision keeps > 1.0 highlights so PQ/HLG video is not clipped by the
++    // SDR OSD overlay.
++    @autoreleasepool {
++        CGColorSpaceRef work =
++            CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearITUR_2020);
++        NSDictionary *opts = @{
++            kCIContextWorkingColorSpace: (id)work,
++            kCIContextWorkingFormat: @(kCIFormatRGBAh),
++        };
++        p->ci_ctx = [[CIContext contextWithOptions:opts] retain];
++        if (work)
++            CGColorSpaceRelease(work);
++    }
++}
++
++// Runtime burn-in switch, read from the embedder-owned video layer each frame.
++// Swift sets `layer.setValue(NSNumber(value: on), forKey: "arnageOsdBurnIn")`.
++// CALayer supports arbitrary KVC keys (returns nil when unset -> off). Boolean
++// NSNumbers are the immortal __NSCFBoolean singletons and pointer reads are
++// atomic on arm64, so the main-thread write / render-thread read needs no lock.
++static bool burn_in_active(struct priv *p)
++{
++    if (!p->layer)
++        return false;
++    NSNumber *v = [p->layer valueForKey:@"arnageOsdBurnIn"];
++    return v != nil && [v boolValue];
++}
++
++// Composite the cached OSD canvas over the video frame on the GPU (CoreImage),
++// returning a new video-format CVPixelBuffer that carries the source colorimetry
++// (so the OS still drives EDR). Returns a +1 buffer, or NULL when there is no
++// OSD to burn (caller enqueues the plain frame) or on failure.
++static CVPixelBufferRef burn_composite(struct vo *vo, struct mp_image *mpi,
++                                       CVPixelBufferRef video)
++{
++    struct priv *p = vo->priv;
++
++    // Cheap change probe (osd_render is cached by mpv); re-render the canvas only
++    // when the OSD moves, reuse the cached buffer otherwise.
++    static const bool osd_formats[SUBBITMAP_COUNT] = {
++        [SUBBITMAP_LIBASS] = true,
++        [SUBBITMAP_BGRA]   = true,
++    };
++    struct mp_osd_res res = osd_res_from_image_params(&mpi->params);
++    struct sub_bitmap_list *list =
++        osd_render(vo->osd, res, mpi->pts, OSD_DRAW_SUB_ONLY, osd_formats);
++    int64_t change_id = list ? list->change_id : 0;
++    int num_items = list ? list->num_items : 0;
++    talloc_free(list);
++
++    if (change_id != p->burn_osd_change_id) {
++        if (p->burn_osd_buf) {
++            CVPixelBufferRelease(p->burn_osd_buf);
++            p->burn_osd_buf = NULL;
++        }
++        p->burn_osd_buf = render_burn_osd_canvas(vo, mpi, num_items);
++        p->burn_osd_change_id = change_id;
++        p->burn_osd_items = p->burn_osd_buf ? num_items : 0;
++    }
++    if (!p->burn_osd_buf || p->burn_osd_items == 0)
++        return NULL;   // nothing to burn — caller enqueues the plain frame
++
++    OSType vfmt = CVPixelBufferGetPixelFormatType(video);
++    int w = (int)CVPixelBufferGetWidth(video);
++    int h = (int)CVPixelBufferGetHeight(video);
++
++    if (!p->burn_pool || p->burn_pool_w != w || p->burn_pool_h != h
++        || p->burn_pool_fmt != vfmt) {
++        if (p->burn_pool) {
++            CVPixelBufferPoolRelease(p->burn_pool);
++            p->burn_pool = NULL;
++        }
++        CFDictionaryRef empty = CFDictionaryCreate(
++            NULL, NULL, NULL, 0,
++            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        int fmti = (int)vfmt;
++        CFNumberRef wn = CFNumberCreate(NULL, kCFNumberIntType, &w);
++        CFNumberRef hn = CFNumberCreate(NULL, kCFNumberIntType, &h);
++        CFNumberRef fn = CFNumberCreate(NULL, kCFNumberIntType, &fmti);
++        const void *keys[4] = {
++            kCVPixelBufferIOSurfacePropertiesKey,
++            kCVPixelBufferPixelFormatTypeKey,
++            kCVPixelBufferWidthKey,
++            kCVPixelBufferHeightKey,
++        };
++        const void *vals[4] = { empty, fn, wn, hn };
++        CFDictionaryRef attrs = CFDictionaryCreate(
++            NULL, keys, vals, 4,
++            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        CVReturn pr = CVPixelBufferPoolCreate(NULL, NULL, attrs, &p->burn_pool);
++        CFRelease(attrs);
++        CFRelease(empty);
++        CFRelease(wn);
++        CFRelease(hn);
++        CFRelease(fn);
++        if (pr != kCVReturnSuccess || !p->burn_pool) {
++            MP_ERR(vo, "burn-in output pool create failed: %d\n", (int)pr);
++            p->burn_pool = NULL;
++            return NULL;
++        }
++        p->burn_pool_w = w;
++        p->burn_pool_h = h;
++        p->burn_pool_fmt = vfmt;
++    }
++
++    CVPixelBufferRef out = NULL;
++    if (CVPixelBufferPoolCreatePixelBuffer(NULL, p->burn_pool, &out) != kCVReturnSuccess
++        || !out)
++        return NULL;
++
++    // Carry the source colorimetry onto the composited buffer so the
++    // CMVideoFormatDescription built from it presents the same colors / EDR.
++    CVBufferPropagateAttachments(video, out);
++
++    ensure_ci_ctx(p);
++    if (!p->ci_ctx) {
++        CVPixelBufferRelease(out);
++        return NULL;
++    }
++
++    CGColorSpaceRef out_cs = burn_output_colorspace(mpi->params.color.transfer);
++    @autoreleasepool {
++        CIImage *bg = [CIImage imageWithCVPixelBuffer:video];
++        CIImage *fg = [CIImage imageWithCVPixelBuffer:p->burn_osd_buf];
++        if (bg && fg) {
++            CIImage *composited = [fg imageByCompositingOverImage:bg];
++            [p->ci_ctx render:composited
++              toCVPixelBuffer:out
++                       bounds:[bg extent]
++                   colorSpace:out_cs];
++        } else {
++            CVPixelBufferRelease(out);
++            out = NULL;
++        }
++    }
++    if (out_cs)
++        CGColorSpaceRelease(out_cs);
++    return out;
++}
++
 +static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 +{
 +    struct priv *p = vo->priv;
@@ -560,6 +833,31 @@ index 0000000..77c3a69
 +    }
 +    if (!pb)
 +        return false;
++
++    // PiP burn-in (arnage #480): composite the OSD into the video frame so the
++    // single layer the OS shows in PiP carries subtitles. Off by default; when
++    // off this whole block is skipped and the VO behaves exactly as #481.
++    bool burn_in = burn_in_active(p);
++    if (burn_in) {
++        CVPixelBufferRef burned = burn_composite(vo, mpi, pb);
++        if (burned) {
++            if (owns_pb)
++                CVPixelBufferRelease(pb);
++            pb = burned;
++            owns_pb = true;
++        }
++        // The separate OSD layer is not presented in PiP; flush it once so a
++        // stale cue does not linger behind the burned-in frames.
++        if (!p->burn_osd_flushed && p->osd_layer) {
++            AVSampleBufferDisplayLayer *ol = p->osd_layer;
++            p->burn_osd_flushed = true;
++            dispatch_async(dispatch_get_main_queue(), ^{
++                [ol flushAndRemoveImage];
++            });
++        }
++    } else {
++        p->burn_osd_flushed = false;
++    }
 +
 +    // (Re)build the format description when the pixel buffer's format changes.
 +    // CMVideoFormatDescriptionCreateForImageBuffer copies the color
@@ -618,8 +916,10 @@ index 0000000..77c3a69
 +        CFRelease(sbuf);   // block owns the only reference
 +    });
 +
-+    // Composite subtitles/OSD onto the inline OSD layer (no-op if disabled).
-+    draw_osd_overlay(vo, mpi);
++    // Composite subtitles/OSD onto the inline OSD layer (no-op if disabled;
++    // skipped while burning in — the OSD is already in the video frame).
++    if (!burn_in)
++        draw_osd_overlay(vo, mpi);
 +
 +    return true;
 +}
@@ -670,6 +970,18 @@ index 0000000..77c3a69
 +    if (p->osd_pool) {
 +        CVPixelBufferPoolRelease(p->osd_pool);
 +        p->osd_pool = NULL;
++    }
++    if (p->burn_osd_buf) {
++        CVPixelBufferRelease(p->burn_osd_buf);
++        p->burn_osd_buf = NULL;
++    }
++    if (p->burn_pool) {
++        CVPixelBufferPoolRelease(p->burn_pool);
++        p->burn_pool = NULL;
++    }
++    if (p->ci_ctx) {
++        [p->ci_ctx release];
++        p->ci_ctx = NULL;
 +    }
 +    p->osd_layer = NULL;   // borrowed; owned by the embedder, do not release
 +}
