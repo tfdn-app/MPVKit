@@ -253,38 +253,38 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1.2/Libavcodec.xcframework.zip",
-            checksum: "bf0aa69d62981ac8859ef08849312474cf5201bf51242ecece86007b2cc07444"
+            url: "https://github.com/tfdn-app/MPVKit/releases/download/0.41.0-arnage.7/Libavcodec.xcframework.zip",
+            checksum: "d54bc0e8ea3725416f1e9627bb8c73db97ccb2a7f3bd4aba08b43cbe20b57610"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1.2/Libavdevice.xcframework.zip",
-            checksum: "3aec22d82735405a32b87488a13c1889277af10522bb5c8dc543278b2f2bb1ac"
+            url: "https://github.com/tfdn-app/MPVKit/releases/download/0.41.0-arnage.7/Libavdevice.xcframework.zip",
+            checksum: "b2f52cffe97403ff34c53adf37494cd9ecca6fca4d605feff018d12ed2b559d1"
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1.2/Libavformat.xcframework.zip",
-            checksum: "962c010aa2c4b369cf8f6efa2b0bd26e0a2392d58a1487e6a2be8c3d73044d45"
+            url: "https://github.com/tfdn-app/MPVKit/releases/download/0.41.0-arnage.7/Libavformat.xcframework.zip",
+            checksum: "9f4cc341b2f716265045e9049eb6a86cbbbefc43f8386672dd882992e374d652"
         ),
         .binaryTarget(
             name: "Libavfilter",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1.2/Libavfilter.xcframework.zip",
-            checksum: "1ea0aebfc460f347d631fad982dd1db3a929896d02722cd18903faeb4c5f4103"
+            url: "https://github.com/tfdn-app/MPVKit/releases/download/0.41.0-arnage.7/Libavfilter.xcframework.zip",
+            checksum: "4b2624fa6f491ed72dfa0582d3108ea92bfe1016938a98fd8293e4c2aa3899c3"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1.2/Libavutil.xcframework.zip",
-            checksum: "62d7d932c0a9d2bd45a23d7845db12a293b4f810e5cfae2b5e4ad05e8b737a1b"
+            url: "https://github.com/tfdn-app/MPVKit/releases/download/0.41.0-arnage.7/Libavutil.xcframework.zip",
+            checksum: "cf7673720ca41e299407068276b46234d0530688989ba056f4a6cfdff2d4b6e3"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1.2/Libswresample.xcframework.zip",
-            checksum: "80fbd7a266d0633a916d21a01fcfab347b4ffb8d16c7a02e43671ef71e6999f0"
+            url: "https://github.com/tfdn-app/MPVKit/releases/download/0.41.0-arnage.7/Libswresample.xcframework.zip",
+            checksum: "d13dc701e4a258c907205a20091ffeb2c4db3eee60c6fbee203ae1119b83cdbd"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0-n8.1.2/Libswscale.xcframework.zip",
-            checksum: "fd968cad30f5295082b86a8ab7ada5dd9ea18e9049ec194a748e91bd0027afb5"
+            url: "https://github.com/tfdn-app/MPVKit/releases/download/0.41.0-arnage.7/Libswscale.xcframework.zip",
+            checksum: "7111e2a9887c6488e364cc78b03337be8456329fc6fcdf138b7f0606d423e69f"
         ),
 
         .binaryTarget(
@@ -301,9 +301,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            // arnage #476: local build carrying the clean-room vo=avfoundation patch
-            // (instead of the upstream release). Produced by `make build platform=ios`.
-            path: "dist/release/xcframework/Libmpv.xcframework"
+            url: "https://github.com/tfdn-app/MPVKit/releases/download/0.41.0-arnage.7/Libmpv.xcframework.zip",
+            checksum: "89701d897e3fef17f29a241aa689ed52e5dc8eb145946db70e104968dab6b11c"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
