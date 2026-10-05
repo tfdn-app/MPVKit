@@ -103,7 +103,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
  static void videotoolbox_decoder_callback(void *opaque,
                                            void *sourceFrameRefCon,
                                            OSStatus status,
-@@ -738,6 +807,24 @@
+@@ -738,6 +807,28 @@
          return;
      }
  
@@ -117,18 +117,22 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 +    }
 +
 +    if (!vtctx->hdr10plus_reported && videotoolbox_hevc_pq_wanted(vtctx->logctx)) {
-+        /* Once per session, on the first picture. */
++        /* Once per session. The SEI of the very first access unit is parsed
++         * before the hwaccel exists and is not submitted, so the first
++         * picture never carries the data: look at the first 48. */
 +        CFTypeRef data = CVBufferGetAttachment(image_buffer, CFSTR("HDR10PlusData"), NULL);
-+        av_log(vtctx->logctx, AV_LOG_INFO,
-+               "VideoToolbox: declared PQ; first decoded picture %s HDR10+ data\n",
-+               data ? "carries" : "carries no");
-+        vtctx->hdr10plus_reported = true;
++        if (data || ++vtctx->hdr10plus_checked >= 48) {
++            av_log(vtctx->logctx, AV_LOG_INFO, "VideoToolbox: declared PQ; %s\n",
++                   data ? "decoded pictures carry HDR10+ data"
++                        : "no HDR10+ data in the first 48 decoded pictures");
++            vtctx->hdr10plus_reported = true;
++        }
 +    }
 +
      vtctx->frame = CVPixelBufferRetain(image_buffer);
  }
  
-@@ -843,7 +930,8 @@
+@@ -843,7 +934,8 @@
                                                                     &kCFTypeDictionaryValueCallBacks);
  
      CFDictionarySetValue(config_info,
@@ -138,7 +142,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
                              kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder :
                              kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
                           kCFBooleanTrue);
-@@ -870,6 +958,21 @@
+@@ -870,6 +962,21 @@
          if (data)
              CFDictionarySetValue(avc_info, CFSTR("hvcC"), data);
          break;
@@ -160,7 +164,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
  #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
      case kCMVideoCodecType_VP9 :
          data = ff_videotoolbox_vpcc_extradata_create(avctx);
-@@ -892,6 +995,20 @@
+@@ -892,6 +999,20 @@
              kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms,
              avc_info);
  
@@ -181,7 +185,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
      if (data)
          CFRelease(data);
  
-@@ -921,6 +1038,22 @@
+@@ -921,6 +1042,23 @@
          break;
      case AV_CODEC_ID_HEVC :
          videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
@@ -194,6 +198,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 +                ((VTContext *)avctx->internal->hwaccel_priv_data)->dovi_reported = false;
 +            }
 +            ((VTContext *)avctx->internal->hwaccel_priv_data)->hdr10plus_reported = false;
++            ((VTContext *)avctx->internal->hwaccel_priv_data)->hdr10plus_checked = 0;
 +            if (h->videotoolbox_dovi && h->dovi_ctx.cfg.dv_profile)
 +                av_log(avctx, AV_LOG_INFO,
 +                       "VideoToolbox: %s as Dolby Vision (profile %d, level %d, compatibility %d)\n",
@@ -204,7 +209,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
          break;
      case AV_CODEC_ID_MPEG1VIDEO :
          videotoolbox->cm_codec_type = kCMVideoCodecType_MPEG1Video;
-@@ -1126,6 +1259,26 @@
+@@ -1126,6 +1264,26 @@
      VTContext *vtctx = avctx->internal->hwaccel_priv_data;
      int ret;
  
@@ -234,15 +239,17 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 diff --git a/libavcodec/vt_internal.h b/libavcodec/vt_internal.h
 --- a/libavcodec/vt_internal.h
 +++ b/libavcodec/vt_internal.h
-@@ -46,6 +46,12 @@
+@@ -46,6 +46,14 @@
      uint8_t                     sps[3];
      bool                        reconfig_needed;
  
 +    // Dolby Vision: whether the first decoded picture has been reported.
 +    bool                        dovi_reported;
 +
-+    // HDR10+: whether the first decoded picture has been reported.
++    // HDR10+: whether the session has been reported, and how many decoded
++    // pictures were looked at before that.
 +    bool                        hdr10plus_reported;
++    int                         hdr10plus_checked;
 +
      void *logctx;
  } VTContext;
