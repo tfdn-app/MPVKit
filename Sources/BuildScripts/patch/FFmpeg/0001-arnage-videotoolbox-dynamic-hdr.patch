@@ -107,7 +107,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
          return;
      }
  
-+    if (!vtctx->dovi_reported && videotoolbox_hevc_dovi_wanted(vtctx->logctx)) {
++    if (vtctx->dovi_session && !vtctx->dovi_reported) {
 +        /* Once per session: did the decoder hand the RPU on with the picture? */
 +        CFTypeRef rpu = CVBufferGetAttachment(image_buffer, CFSTR("DolbyVisionRPUData"), NULL);
 +        av_log(vtctx->logctx, AV_LOG_INFO,
@@ -116,7 +116,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 +        vtctx->dovi_reported = true;
 +    }
 +
-+    if (!vtctx->hdr10plus_reported && videotoolbox_hevc_pq_wanted(vtctx->logctx)) {
++    if (vtctx->pq_session && !vtctx->hdr10plus_reported) {
 +        /* Once per session. The SEI of the very first access unit is parsed
 +         * before the hwaccel exists and is not submitted, so the first
 +         * picture never carries the data: look at the first 48. */
@@ -168,7 +168,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
              kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms,
              avc_info);
  
-+    if (videotoolbox_hevc_pq_wanted(avctx)) {
++    if (((VTContext *)avctx->internal->hwaccel_priv_data)->pq_session) {
 +        CFDictionarySetValue(config_info,
 +                             kCMFormatDescriptionExtension_TransferFunction,
 +                             kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ);
@@ -185,35 +185,63 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
      if (data)
          CFRelease(data);
  
-@@ -921,6 +1042,23 @@
+@@ -921,6 +1042,28 @@
          break;
      case AV_CODEC_ID_HEVC :
          videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
 +        {
 +            const HEVCContext *h = avctx->priv_data;
-+            const int dovi = videotoolbox_hevc_dovi_wanted(avctx);
++            VTContext *vtctx = avctx->internal->hwaccel_priv_data;
 +
-+            if (dovi) {
++            /* Decided here, once per session: the decoder's own state can
++             * change while the session lives (a new configuration record in
++             * packet side data, or one reset after an unparsable RPU). */
++            vtctx->dovi_session       = videotoolbox_hevc_dovi_wanted(avctx) && !vtctx->dovi_refused;
++            vtctx->dovi_reported      = false;
++            vtctx->pq_session         = videotoolbox_hevc_pq_wanted(avctx);
++            vtctx->hdr10plus_reported = false;
++            vtctx->hdr10plus_checked  = 0;
++
++            if (vtctx->dovi_session)
 +                videotoolbox->cm_codec_type = VT_CODEC_TYPE_DOLBY_VISION_HEVC;
-+                ((VTContext *)avctx->internal->hwaccel_priv_data)->dovi_reported = false;
-+            }
-+            ((VTContext *)avctx->internal->hwaccel_priv_data)->hdr10plus_reported = false;
-+            ((VTContext *)avctx->internal->hwaccel_priv_data)->hdr10plus_checked = 0;
 +            if (h->videotoolbox_dovi && h->dovi_ctx.cfg.dv_profile)
 +                av_log(avctx, AV_LOG_INFO,
 +                       "VideoToolbox: %s as Dolby Vision (profile %d, level %d, compatibility %d)\n",
-+                       dovi ? "opening" : "not opening",
++                       vtctx->dovi_session ? "opening" : "not opening",
 +                       h->dovi_ctx.cfg.dv_profile, h->dovi_ctx.cfg.dv_level,
 +                       h->dovi_ctx.cfg.dv_bl_signal_compatibility_id);
 +        }
          break;
      case AV_CODEC_ID_MPEG1VIDEO :
          videotoolbox->cm_codec_type = kCMVideoCodecType_MPEG1Video;
-@@ -1126,6 +1264,26 @@
+@@ -1008,6 +1151,22 @@
+     if (buf_attr)
+         CFRelease(buf_attr);
+ 
++    if (status != noErr && avctx->codec_id == AV_CODEC_ID_HEVC &&
++        ((VTContext *)avctx->internal->hwaccel_priv_data)->dovi_session) {
++        /* The decoder refuses a Dolby Vision session (hardware that decodes
++         * HEVC but not Dolby Vision, or a stream it rejects): open this
++         * stream as plain HEVC, as without the option, and do not ask again. */
++        VTContext *vtctx = avctx->internal->hwaccel_priv_data;
++
++        av_log(avctx, AV_LOG_INFO,
++               "VideoToolbox: Dolby Vision session refused (%d), opening as plain HEVC\n", (int)status);
++        CFRelease(videotoolbox->cm_fmt_desc);
++        videotoolbox->cm_fmt_desc = NULL;
++        videotoolbox->session     = NULL;
++        vtctx->dovi_refused       = true;
++        return videotoolbox_start(avctx);
++    }
++
+     switch (status) {
+     case kVTVideoDecoderNotAvailableNowErr:
+         av_log(avctx, AV_LOG_VERBOSE, "VideoToolbox session not available.\n");
+@@ -1126,6 +1285,26 @@
      VTContext *vtctx = avctx->internal->hwaccel_priv_data;
      int ret;
  
-+    if (videotoolbox_hevc_dovi_wanted(avctx)) {
++    if (vtctx->dovi_session) {
 +        /* The RPU of this access unit was set aside by the HEVC decoder,
 +         * without its two NAL header bytes. Submit it as the last NAL unit:
 +         * type 62, layer 0, temporal id 1. */
@@ -239,15 +267,22 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 diff --git a/libavcodec/vt_internal.h b/libavcodec/vt_internal.h
 --- a/libavcodec/vt_internal.h
 +++ b/libavcodec/vt_internal.h
-@@ -46,6 +46,14 @@
+@@ -46,6 +46,21 @@
      uint8_t                     sps[3];
      bool                        reconfig_needed;
  
-+    // Dolby Vision: whether the first decoded picture has been reported.
++    // Dolby Vision: whether the current session was opened as Dolby Vision
++    // (decided once, when the session is created), whether the decoder
++    // refused such a session, and whether the first decoded picture has been
++    // reported.
++    bool                        dovi_session;
++    bool                        dovi_refused;
 +    bool                        dovi_reported;
 +
-+    // HDR10+: whether the session has been reported, and how many decoded
++    // HDR10+: whether the current session declares PQ (decided when the
++    // session is created), whether it has been reported, and how many decoded
 +    // pictures were looked at before that.
++    bool                        pq_session;
 +    bool                        hdr10plus_reported;
 +    int                         hdr10plus_checked;
 +
