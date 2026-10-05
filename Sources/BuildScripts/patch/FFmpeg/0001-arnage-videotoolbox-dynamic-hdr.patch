@@ -1,30 +1,33 @@
 diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
 --- a/libavcodec/hevc/hevcdec.c
 +++ b/libavcodec/hevc/hevcdec.c
-@@ -4212,6 +4212,8 @@
+@@ -4212,6 +4212,10 @@
          AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
      { "strict-displaywin", "strictly apply default display window size", OFFSET(apply_defdispwin),
          AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
 +    { "videotoolbox_dovi", "open the VideoToolbox decoder as Dolby Vision (profiles 5 and 8) and submit the RPU of each access unit",
 +        OFFSET(videotoolbox_dovi), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
++    { "videotoolbox_hdr10plus", "declare the PQ transfer function to the VideoToolbox decoder, so that it hands HDR10+ per-frame data on with the decoded picture",
++        OFFSET(videotoolbox_hdr10plus), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
      { "view_ids", "Array of view IDs that should be decoded and output; a single -1 to decode all views",
          .offset = OFFSET(view_ids), .type = AV_OPT_TYPE_INT | AV_OPT_TYPE_FLAG_ARRAY,
          .min = -1, .max = INT_MAX, .flags = PAR },
 diff --git a/libavcodec/hevc/hevcdec.h b/libavcodec/hevc/hevcdec.h
 --- a/libavcodec/hevc/hevcdec.h
 +++ b/libavcodec/hevc/hevcdec.h
-@@ -560,6 +560,7 @@
+@@ -560,6 +560,8 @@
      int is_nalff;           ///< this flag is != 0 if bitstream is encapsulated
                              ///< as a format defined in 14496-15
      int apply_defdispwin;
 +    int videotoolbox_dovi;  ///< AVOption: declare Dolby Vision to VideoToolbox
++    int videotoolbox_hdr10plus; ///< AVOption: declare PQ to VideoToolbox, which then hands HDR10+ data on
  
      // multi-layer AVOptions
      int         *view_ids;
 diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 --- a/libavcodec/videotoolbox.c
 +++ b/libavcodec/videotoolbox.c
-@@ -712,6 +712,58 @@
+@@ -712,6 +712,75 @@
      return sample_buf;
  }
  
@@ -58,6 +61,23 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 +            h->dovi_ctx.cfg.dv_bl_signal_compatibility_id == 4);
 +}
 +
++/*
++ * HDR10+, opt-in through the HEVC decoder option "videotoolbox_hdr10plus".
++ *
++ * The decoder hands the HDR10+ per-frame data of the bitstream on with the
++ * decoded picture only if the session's format description declares the PQ
++ * transfer function. (The SEI NAL units themselves are already submitted.)
++ */
++static int videotoolbox_hevc_pq_wanted(AVCodecContext *avctx)
++{
++    const HEVCContext *h;
++
++    if (avctx->codec_id != AV_CODEC_ID_HEVC)
++        return 0;
++    h = avctx->priv_data;
++    return h->videotoolbox_hdr10plus && avctx->color_trc == AVCOL_TRC_SMPTE2084;
++}
++
 +/* The 24-byte DOVIDecoderConfigurationRecord of the stream. */
 +static CFDataRef videotoolbox_dovi_record_create(AVCodecContext *avctx)
 +{
@@ -83,7 +103,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
  static void videotoolbox_decoder_callback(void *opaque,
                                            void *sourceFrameRefCon,
                                            OSStatus status,
-@@ -738,6 +790,15 @@
+@@ -738,6 +807,24 @@
          return;
      }
  
@@ -96,10 +116,19 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 +        vtctx->dovi_reported = true;
 +    }
 +
++    if (!vtctx->hdr10plus_reported && videotoolbox_hevc_pq_wanted(vtctx->logctx)) {
++        /* Once per session, on the first picture. */
++        CFTypeRef data = CVBufferGetAttachment(image_buffer, CFSTR("HDR10PlusData"), NULL);
++        av_log(vtctx->logctx, AV_LOG_INFO,
++               "VideoToolbox: declared PQ; first decoded picture %s HDR10+ data\n",
++               data ? "carries" : "carries no");
++        vtctx->hdr10plus_reported = true;
++    }
++
      vtctx->frame = CVPixelBufferRetain(image_buffer);
  }
  
-@@ -843,7 +904,8 @@
+@@ -843,7 +930,8 @@
                                                                     &kCFTypeDictionaryValueCallBacks);
  
      CFDictionarySetValue(config_info,
@@ -109,7 +138,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
                              kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder :
                              kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
                           kCFBooleanTrue);
-@@ -870,6 +932,21 @@
+@@ -870,6 +958,21 @@
          if (data)
              CFDictionarySetValue(avc_info, CFSTR("hvcC"), data);
          break;
@@ -131,7 +160,28 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
  #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
      case kCMVideoCodecType_VP9 :
          data = ff_videotoolbox_vpcc_extradata_create(avctx);
-@@ -921,6 +998,21 @@
+@@ -892,6 +995,20 @@
+             kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms,
+             avc_info);
+ 
++    if (videotoolbox_hevc_pq_wanted(avctx)) {
++        CFDictionarySetValue(config_info,
++                             kCMFormatDescriptionExtension_TransferFunction,
++                             kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ);
++        if (avctx->color_primaries == AVCOL_PRI_BT2020)
++            CFDictionarySetValue(config_info,
++                                 kCMFormatDescriptionExtension_ColorPrimaries,
++                                 kCMFormatDescriptionColorPrimaries_ITU_R_2020);
++        if (avctx->colorspace == AVCOL_SPC_BT2020_NCL)
++            CFDictionarySetValue(config_info,
++                                 kCMFormatDescriptionExtension_YCbCrMatrix,
++                                 kCMFormatDescriptionYCbCrMatrix_ITU_R_2020);
++    }
++
+     if (data)
+         CFRelease(data);
+ 
+@@ -921,6 +1038,22 @@
          break;
      case AV_CODEC_ID_HEVC :
          videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
@@ -143,6 +193,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 +                videotoolbox->cm_codec_type = VT_CODEC_TYPE_DOLBY_VISION_HEVC;
 +                ((VTContext *)avctx->internal->hwaccel_priv_data)->dovi_reported = false;
 +            }
++            ((VTContext *)avctx->internal->hwaccel_priv_data)->hdr10plus_reported = false;
 +            if (h->videotoolbox_dovi && h->dovi_ctx.cfg.dv_profile)
 +                av_log(avctx, AV_LOG_INFO,
 +                       "VideoToolbox: %s as Dolby Vision (profile %d, level %d, compatibility %d)\n",
@@ -153,7 +204,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
          break;
      case AV_CODEC_ID_MPEG1VIDEO :
          videotoolbox->cm_codec_type = kCMVideoCodecType_MPEG1Video;
-@@ -1126,6 +1218,26 @@
+@@ -1126,6 +1259,26 @@
      VTContext *vtctx = avctx->internal->hwaccel_priv_data;
      int ret;
  
@@ -183,12 +234,15 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 diff --git a/libavcodec/vt_internal.h b/libavcodec/vt_internal.h
 --- a/libavcodec/vt_internal.h
 +++ b/libavcodec/vt_internal.h
-@@ -46,6 +46,9 @@
+@@ -46,6 +46,12 @@
      uint8_t                     sps[3];
      bool                        reconfig_needed;
  
 +    // Dolby Vision: whether the first decoded picture has been reported.
 +    bool                        dovi_reported;
++
++    // HDR10+: whether the first decoded picture has been reported.
++    bool                        hdr10plus_reported;
 +
      void *logctx;
  } VTContext;
