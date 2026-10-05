@@ -1,0 +1,152 @@
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -4212,6 +4212,8 @@
+         AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
+     { "strict-displaywin", "strictly apply default display window size", OFFSET(apply_defdispwin),
+         AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
++    { "videotoolbox_dovi", "open the VideoToolbox decoder as Dolby Vision (profiles 5 and 8) and submit the RPU of each access unit",
++        OFFSET(videotoolbox_dovi), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
+     { "view_ids", "Array of view IDs that should be decoded and output; a single -1 to decode all views",
+         .offset = OFFSET(view_ids), .type = AV_OPT_TYPE_INT | AV_OPT_TYPE_FLAG_ARRAY,
+         .min = -1, .max = INT_MAX, .flags = PAR },
+diff --git a/libavcodec/hevc/hevcdec.h b/libavcodec/hevc/hevcdec.h
+--- a/libavcodec/hevc/hevcdec.h
++++ b/libavcodec/hevc/hevcdec.h
+@@ -560,6 +560,7 @@
+     int is_nalff;           ///< this flag is != 0 if bitstream is encapsulated
+                             ///< as a format defined in 14496-15
+     int apply_defdispwin;
++    int videotoolbox_dovi;  ///< AVOption: declare Dolby Vision to VideoToolbox
+ 
+     // multi-layer AVOptions
+     int         *view_ids;
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -831,6 +831,51 @@
+     return buffer_attributes;
+ }
+ 
++/*
++ * Dolby Vision (profiles 5 and 8), opt-in through the HEVC decoder option
++ * "videotoolbox_dovi".
++ *
++ * Opened as plain HEVC, the decoder ignores the RPU. Opened as Dolby Vision
++ * ('dvh1', with the stream's configuration record next to hvcC) and given the
++ * RPU NAL unit of each access unit, it hands the RPU on with the decoded
++ * picture, for the display stage to compose.
++ */
++enum { VT_CODEC_TYPE_DOLBY_VISION_HEVC = 'dvh1' };
++
++static int videotoolbox_hevc_dovi_wanted(AVCodecContext *avctx)
++{
++    const HEVCContext *h;
++
++    if (avctx->codec_id != AV_CODEC_ID_HEVC)
++        return 0;
++    h = avctx->priv_data;
++    if (!h->videotoolbox_dovi)
++        return 0;
++    return h->dovi_ctx.cfg.dv_profile == 5 || h->dovi_ctx.cfg.dv_profile == 8;
++}
++
++/* The 24-byte DOVIDecoderConfigurationRecord of the stream. */
++static CFDataRef videotoolbox_dovi_record_create(AVCodecContext *avctx)
++{
++    const HEVCContext *h = avctx->priv_data;
++    const AVDOVIDecoderConfigurationRecord *cfg = &h->dovi_ctx.cfg;
++    uint8_t record[24] = { 0 };
++    unsigned packed = (cfg->dv_profile & 0x7F) << 9 |
++                      (cfg->dv_level   & 0x3F) << 3 |
++                      (cfg->rpu_present_flag & 1) << 2 |
++                      (cfg->el_present_flag  & 1) << 1 |
++                      (cfg->bl_present_flag  & 1);
++
++    record[0] = cfg->dv_version_major;
++    record[1] = cfg->dv_version_minor;
++    record[2] = packed >> 8;
++    record[3] = packed & 0xFF;
++    record[4] = (cfg->dv_bl_signal_compatibility_id & 0x0F) << 4 |
++                (cfg->dv_md_compression & 0x03) << 2;
++
++    return CFDataCreate(kCFAllocatorDefault, record, sizeof(record));
++}
++
+ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec_type,
+                                                           AVCodecContext *avctx)
+ {
+@@ -843,7 +888,8 @@
+                                                                    &kCFTypeDictionaryValueCallBacks);
+ 
+     CFDictionarySetValue(config_info,
+-                         codec_type == kCMVideoCodecType_HEVC ?
++                         (codec_type == kCMVideoCodecType_HEVC ||
++                          codec_type == VT_CODEC_TYPE_DOLBY_VISION_HEVC) ?
+                             kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder :
+                             kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
+                          kCFBooleanTrue);
+@@ -870,6 +916,21 @@
+         if (data)
+             CFDictionarySetValue(avc_info, CFSTR("hvcC"), data);
+         break;
++    case VT_CODEC_TYPE_DOLBY_VISION_HEVC : {
++        const HEVCContext *h = avctx->priv_data;
++        CFDataRef dovi = videotoolbox_dovi_record_create(avctx);
++
++        data = ff_videotoolbox_hvcc_extradata_create(avctx);
++        if (data)
++            CFDictionarySetValue(avc_info, CFSTR("hvcC"), data);
++        if (dovi) {
++            CFDictionarySetValue(avc_info,
++                                 h->dovi_ctx.cfg.dv_profile > 7 ? CFSTR("dvvC") : CFSTR("dvcC"),
++                                 dovi);
++            CFRelease(dovi);
++        }
++        break;
++    }
+ #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
+     case kCMVideoCodecType_VP9 :
+         data = ff_videotoolbox_vpcc_extradata_create(avctx);
+@@ -921,6 +982,14 @@
+         break;
+     case AV_CODEC_ID_HEVC :
+         videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
++        if (videotoolbox_hevc_dovi_wanted(avctx)) {
++            const HEVCContext *h = avctx->priv_data;
++            videotoolbox->cm_codec_type = VT_CODEC_TYPE_DOLBY_VISION_HEVC;
++            av_log(avctx, AV_LOG_INFO,
++                   "VideoToolbox: opening as Dolby Vision (profile %d, level %d, compatibility %d)\n",
++                   h->dovi_ctx.cfg.dv_profile, h->dovi_ctx.cfg.dv_level,
++                   h->dovi_ctx.cfg.dv_bl_signal_compatibility_id);
++        }
+         break;
+     case AV_CODEC_ID_MPEG1VIDEO :
+         videotoolbox->cm_codec_type = kCMVideoCodecType_MPEG1Video;
+@@ -1126,6 +1195,26 @@
+     VTContext *vtctx = avctx->internal->hwaccel_priv_data;
+     int ret;
+ 
++    if (videotoolbox_hevc_dovi_wanted(avctx)) {
++        /* The RPU of this access unit was set aside by the HEVC decoder,
++         * without its two NAL header bytes. Submit it as the last NAL unit:
++         * type 62, layer 0, temporal id 1. */
++        const AVFrameSideData *rpu =
++            av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_RPU_BUFFER);
++        if (rpu && rpu->size > 0 && vtctx->bitstream_size > 0) {
++            void *tmp = av_fast_realloc(vtctx->bitstream, &vtctx->allocated_size,
++                                        vtctx->bitstream_size + rpu->size + 6);
++            if (!tmp)
++                return AVERROR(ENOMEM);
++            vtctx->bitstream = tmp;
++            AV_WB32(vtctx->bitstream + vtctx->bitstream_size, rpu->size + 2);
++            vtctx->bitstream[vtctx->bitstream_size + 4] = 0x7C;
++            vtctx->bitstream[vtctx->bitstream_size + 5] = 0x01;
++            memcpy(vtctx->bitstream + vtctx->bitstream_size + 6, rpu->data, rpu->size);
++            vtctx->bitstream_size += rpu->size + 6;
++        }
++    }
++
+     ret = ff_videotoolbox_common_end_frame(avctx, frame);
+     vtctx->bitstream_size = 0;
+     return ret;
