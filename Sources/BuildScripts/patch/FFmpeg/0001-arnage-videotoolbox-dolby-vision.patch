@@ -24,8 +24,8 @@ diff --git a/libavcodec/hevc/hevcdec.h b/libavcodec/hevc/hevcdec.h
 diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 --- a/libavcodec/videotoolbox.c
 +++ b/libavcodec/videotoolbox.c
-@@ -831,6 +831,51 @@
-     return buffer_attributes;
+@@ -712,6 +712,51 @@
+     return sample_buf;
  }
  
 +/*
@@ -73,10 +73,26 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 +    return CFDataCreate(kCFAllocatorDefault, record, sizeof(record));
 +}
 +
- static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec_type,
-                                                           AVCodecContext *avctx)
- {
-@@ -843,7 +888,8 @@
+ static void videotoolbox_decoder_callback(void *opaque,
+                                           void *sourceFrameRefCon,
+                                           OSStatus status,
+@@ -738,6 +783,15 @@
+         return;
+     }
+ 
++    if (!vtctx->dovi_reported && videotoolbox_hevc_dovi_wanted(vtctx->logctx)) {
++        /* Once per session: did the decoder hand the RPU on with the picture? */
++        CFTypeRef rpu = CVBufferGetAttachment(image_buffer, CFSTR("DolbyVisionRPUData"), NULL);
++        av_log(vtctx->logctx, AV_LOG_INFO,
++               "VideoToolbox: decoded picture %s Dolby Vision RPU data\n",
++               rpu ? "carries" : "does NOT carry");
++        vtctx->dovi_reported = true;
++    }
++
+     vtctx->frame = CVPixelBufferRetain(image_buffer);
+ }
+ 
+@@ -843,7 +897,8 @@
                                                                     &kCFTypeDictionaryValueCallBacks);
  
      CFDictionarySetValue(config_info,
@@ -86,7 +102,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
                              kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder :
                              kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
                           kCFBooleanTrue);
-@@ -870,6 +916,21 @@
+@@ -870,6 +925,21 @@
          if (data)
              CFDictionarySetValue(avc_info, CFSTR("hvcC"), data);
          break;
@@ -108,13 +124,14 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
  #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
      case kCMVideoCodecType_VP9 :
          data = ff_videotoolbox_vpcc_extradata_create(avctx);
-@@ -921,6 +982,14 @@
+@@ -921,6 +991,15 @@
          break;
      case AV_CODEC_ID_HEVC :
          videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
 +        if (videotoolbox_hevc_dovi_wanted(avctx)) {
 +            const HEVCContext *h = avctx->priv_data;
 +            videotoolbox->cm_codec_type = VT_CODEC_TYPE_DOLBY_VISION_HEVC;
++            ((VTContext *)avctx->internal->hwaccel_priv_data)->dovi_reported = false;
 +            av_log(avctx, AV_LOG_INFO,
 +                   "VideoToolbox: opening as Dolby Vision (profile %d, level %d, compatibility %d)\n",
 +                   h->dovi_ctx.cfg.dv_profile, h->dovi_ctx.cfg.dv_level,
@@ -123,7 +140,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
          break;
      case AV_CODEC_ID_MPEG1VIDEO :
          videotoolbox->cm_codec_type = kCMVideoCodecType_MPEG1Video;
-@@ -1126,6 +1195,26 @@
+@@ -1126,6 +1205,26 @@
      VTContext *vtctx = avctx->internal->hwaccel_priv_data;
      int ret;
  
@@ -150,3 +167,16 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
      ret = ff_videotoolbox_common_end_frame(avctx, frame);
      vtctx->bitstream_size = 0;
      return ret;
+diff --git a/libavcodec/vt_internal.h b/libavcodec/vt_internal.h
+--- a/libavcodec/vt_internal.h
++++ b/libavcodec/vt_internal.h
+@@ -46,6 +46,9 @@
+     uint8_t                     sps[3];
+     bool                        reconfig_needed;
+ 
++    // Dolby Vision: whether the first decoded picture has been reported.
++    bool                        dovi_reported;
++
+     void *logctx;
+ } VTContext;
+ 
