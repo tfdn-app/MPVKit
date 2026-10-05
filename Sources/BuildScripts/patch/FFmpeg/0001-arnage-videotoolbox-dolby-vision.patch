@@ -24,7 +24,7 @@ diff --git a/libavcodec/hevc/hevcdec.h b/libavcodec/hevc/hevcdec.h
 diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 --- a/libavcodec/videotoolbox.c
 +++ b/libavcodec/videotoolbox.c
-@@ -712,6 +712,51 @@
+@@ -712,6 +712,58 @@
      return sample_buf;
  }
  
@@ -48,7 +48,14 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 +    h = avctx->priv_data;
 +    if (!h->videotoolbox_dovi)
 +        return 0;
-+    return h->dovi_ctx.cfg.dv_profile == 5 || h->dovi_ctx.cfg.dv_profile == 8;
++    if (h->dovi_ctx.cfg.dv_profile == 5)
++        return 1;
++    /* Profile 8 only with a defined cross-compatible base layer (1 = HDR10,
++     * 2 = SDR, 4 = HLG): the decoder refuses a session for any other id. */
++    return h->dovi_ctx.cfg.dv_profile == 8 &&
++           (h->dovi_ctx.cfg.dv_bl_signal_compatibility_id == 1 ||
++            h->dovi_ctx.cfg.dv_bl_signal_compatibility_id == 2 ||
++            h->dovi_ctx.cfg.dv_bl_signal_compatibility_id == 4);
 +}
 +
 +/* The 24-byte DOVIDecoderConfigurationRecord of the stream. */
@@ -76,7 +83,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
  static void videotoolbox_decoder_callback(void *opaque,
                                            void *sourceFrameRefCon,
                                            OSStatus status,
-@@ -738,6 +783,15 @@
+@@ -738,6 +790,15 @@
          return;
      }
  
@@ -92,7 +99,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
      vtctx->frame = CVPixelBufferRetain(image_buffer);
  }
  
-@@ -843,7 +897,8 @@
+@@ -843,7 +904,8 @@
                                                                     &kCFTypeDictionaryValueCallBacks);
  
      CFDictionarySetValue(config_info,
@@ -102,7 +109,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
                              kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder :
                              kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
                           kCFBooleanTrue);
-@@ -870,6 +925,21 @@
+@@ -870,6 +932,21 @@
          if (data)
              CFDictionarySetValue(avc_info, CFSTR("hvcC"), data);
          break;
@@ -124,23 +131,29 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
  #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
      case kCMVideoCodecType_VP9 :
          data = ff_videotoolbox_vpcc_extradata_create(avctx);
-@@ -921,6 +991,15 @@
+@@ -921,6 +998,21 @@
          break;
      case AV_CODEC_ID_HEVC :
          videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
-+        if (videotoolbox_hevc_dovi_wanted(avctx)) {
++        {
 +            const HEVCContext *h = avctx->priv_data;
-+            videotoolbox->cm_codec_type = VT_CODEC_TYPE_DOLBY_VISION_HEVC;
-+            ((VTContext *)avctx->internal->hwaccel_priv_data)->dovi_reported = false;
-+            av_log(avctx, AV_LOG_INFO,
-+                   "VideoToolbox: opening as Dolby Vision (profile %d, level %d, compatibility %d)\n",
-+                   h->dovi_ctx.cfg.dv_profile, h->dovi_ctx.cfg.dv_level,
-+                   h->dovi_ctx.cfg.dv_bl_signal_compatibility_id);
++            const int dovi = videotoolbox_hevc_dovi_wanted(avctx);
++
++            if (dovi) {
++                videotoolbox->cm_codec_type = VT_CODEC_TYPE_DOLBY_VISION_HEVC;
++                ((VTContext *)avctx->internal->hwaccel_priv_data)->dovi_reported = false;
++            }
++            if (h->videotoolbox_dovi && h->dovi_ctx.cfg.dv_profile)
++                av_log(avctx, AV_LOG_INFO,
++                       "VideoToolbox: %s as Dolby Vision (profile %d, level %d, compatibility %d)\n",
++                       dovi ? "opening" : "not opening",
++                       h->dovi_ctx.cfg.dv_profile, h->dovi_ctx.cfg.dv_level,
++                       h->dovi_ctx.cfg.dv_bl_signal_compatibility_id);
 +        }
          break;
      case AV_CODEC_ID_MPEG1VIDEO :
          videotoolbox->cm_codec_type = kCMVideoCodecType_MPEG1Video;
-@@ -1126,6 +1205,26 @@
+@@ -1126,6 +1218,26 @@
      VTContext *vtctx = avctx->internal->hwaccel_priv_data;
      int ret;
  
